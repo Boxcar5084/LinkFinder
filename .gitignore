@@ -1,5 +1,4 @@
 blockchain_cache.db
 .DS_Store
-blockchain_cache.db*
 checkpoints/
 exports/
