@@ -44,7 +44,16 @@ SKIP_DISTRIBUTION_MIN_OUTPUTS = 100       # Min outputs to trigger filter
 
 MAX_TRANSACTIONS_PER_ADDRESS = 50
 MAX_DEPTH = 10
-CACHE_MAX_SIZE_MB = 2048
+
+# Cache management
+CACHE_MAX_SIZE_MB = 2048           # Maximum cache size in MB
+CACHE_PRUNE_TARGET = 0.7           # Prune to 70% of max (leaves 30% buffer)
+CACHE_SINGLE_ENTRY_LIMIT_MB = 100  # Max size for single entry (skip if larger)
+
+# Alternative: Disable cache entirely for huge datasets
+DISABLE_CACHE = False              # Set to True to disable caching
+CACHE_ONLY_ESSENTIAL = False       # Only cache addresses with <5 transactions
+
 
 # Checkpoint and export directories
 CHECKPOINT_DIR = os.path.join(os.getcwd(), "checkpoints")

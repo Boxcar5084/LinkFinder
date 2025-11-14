@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
-
 """
-BULLETPROOF BIDIRECTIONAL BFS WITH CHECKPOINT RESUME
-Checks discovered addresses against BOTH visited AND queued from opposite direction.
-This guarantees NO connections are missed, even if they're in the queue waiting to be explored.
-Supports resuming from checkpoints with proper set handling.
+Bitcoin Address Linker - Graph Engine with Bidirectional BFS
+Connects two sets of Bitcoin addresses through transaction chains.
 """
 
 import asyncio
@@ -12,7 +9,13 @@ from typing import Set, Dict, List, Tuple, Optional, Any, Union
 from collections import deque
 from api_provider import APIProvider
 from cache_manager import TransactionCache
-from config import MAX_TRANSACTIONS_PER_ADDRESS, SKIP_MIXER_INPUT_THRESHOLD, SKIP_MIXER_OUTPUT_THRESHOLD, SKIP_DISTRIBUTION_MAX_INPUTS, SKIP_DISTRIBUTION_MIN_OUTPUTS
+from config import (
+    MAX_TRANSACTIONS_PER_ADDRESS,
+    SKIP_MIXER_INPUT_THRESHOLD,
+    SKIP_MIXER_OUTPUT_THRESHOLD,
+    SKIP_DISTRIBUTION_MAX_INPUTS,
+    SKIP_DISTRIBUTION_MIN_OUTPUTS
+)
 
 
 class BitcoinAddressLinker:
@@ -23,123 +26,6 @@ class BitcoinAddressLinker:
         self.api = api_provider
         self.cache = cache_manager
         self.max_tx_per_address = max_tx_per_address
-        self.coinjoin_patterns = ['coinjoin', 'wasabi', 'samourai', 'whirlpool']
-
-    def _is_coinjoin(self, tx: Dict[str, Any]) -> bool:
-        """Detect likely CoinJoin transactions"""
-        inputs_count = len(tx.get('inputs', []))
-        outputs_count = len(tx.get('outputs', []))
-
-        if inputs_count < 5 or outputs_count < 5:
-            return False
-
-        tx_str = str(tx).lower()
-        for pattern in self.coinjoin_patterns:
-            if pattern in tx_str:
-                return True
-
-        return False
-
-
-# graph_engine.py - REVISED
-
-    # CORRECTED: _should_skip_transaction using config.py values
-
-
-
-    def _should_skip_transaction(self, tx: Dict[str, Any]) -> bool:
-        """
-        Skip transactions that break analysis chains.
-        Uses thresholds from config.py for flexibility.
-        """
-        try:
-            # Get input/output counts
-            inputs_count = len(tx.get('vin', []))
-            outputs_count = len(tx.get('vout', []))
-            
-            if inputs_count == 0:
-                inputs_count = len(tx.get('inputs', []))
-            if outputs_count == 0:
-                outputs_count = len(tx.get('out', []))
-            
-            # FILTER 1: Extreme mixers (both sides massive)
-            if inputs_count >= SKIP_MIXER_INPUT_THRESHOLD and outputs_count >= SKIP_MIXER_OUTPUT_THRESHOLD:
-                print(f"    [SKIP] Extreme mixer: {inputs_count} in â†’ {outputs_count} out")
-                return True
-            
-            # FILTER 2: Distribution/Airdrop transactions (CRITICAL!)
-            # Very few inputs to MASSIVE outputs = unrelated recipients
-            if inputs_count <= SKIP_DISTRIBUTION_MAX_INPUTS and outputs_count >= SKIP_DISTRIBUTION_MIN_OUTPUTS:
-                print(f"    [SKIP] Airdrop/Distribution: {inputs_count} in â†’ {outputs_count} out")
-                return True
-            
-            # FILTER 3: CoinJoin patterns
-            if self._is_coinjoin(tx):
-                print(f"    [SKIP] CoinJoin detected")
-                return True
-            
-            return False
-        
-        except Exception as e:
-            print(f"    Error checking transaction: {e}")
-            return False
-
-
-    def _is_suspicious_mixing_transaction(self, tx: Dict[str, Any]) -> bool:
-        """
-        Only filter EXTREME cases (both 50+ inputs AND 50+ outputs)
-        Skip the ratio-based filtering - those often link related addresses!
-        """
-        try:
-            inputs_count = len(tx.get('vin', []))
-            outputs_count = len(tx.get('vout', []))
-            
-            if inputs_count == 0:
-                inputs_count = len(tx.get('inputs', []))
-            if outputs_count == 0:
-                outputs_count = len(tx.get('out', []))
-            
-            # ONLY filter obvious mixers (both sides extreme)
-            if inputs_count >= 50 and outputs_count >= 50:
-                print(f"    [MIXER] Skipping: {inputs_count} in, {outputs_count} out")
-                return True
-            
-            # ✅ REMOVE the ratio-based filtering - those are usually valid!
-            # High consolidation (100→1) or distribution (1→100) 
-            # often indicates same owner
-            
-            return False
-
-            
-        except Exception as e:
-            print(f"    Error checking for mixer pattern: {e}")
-            return False
-
-
-
-    async def get_address_txs(self, address: str,
-                            start_block: Optional[int] = None,
-                            end_block: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Fetch transactions with smart filtering"""
-        block_range = (start_block, end_block) if (start_block or end_block) else None
-
-        cached = self.cache.get_cached(address, block_range)
-        if cached:
-            return cached
-
-        print(f"[*] Fetching: {address}")
-        txs = await self.api.get_address_transactions(address, start_block, end_block)
-
-        # Apply all smart filters
-        txs = [tx for tx in txs if not self._should_skip_transaction(tx)]
-        
-        # Limit to MAX_TRANSACTIONS_PER_ADDRESS
-        txs = txs[:self.max_tx_per_address]
-
-        if txs:
-            self.cache.cache(address, txs, block_range)
-
-        return txs
 
     def _extract_addresses(self, tx: Dict[str, Any], direction: str = 'output') -> Set[str]:
         """Extract addresses from transaction"""
@@ -193,248 +79,134 @@ class BitcoinAddressLinker:
 
         return addresses
 
-    def _ensure_set(self, value: Union[Set, List, Dict]) -> Set:
-        """Convert any collection type to set"""
-        if isinstance(value, set):
-            return value
-        elif isinstance(value, list):
-            return set(value)
-        elif isinstance(value, dict):
-            return set(value.keys())
-        else:
-            return set()
+    def _is_coinjoin(self, tx: Dict[str, Any]) -> bool:
+        """Check if transaction is a CoinJoin pattern (Wasabi/Samourai)"""
+        try:
+            inputs_count = len(tx.get('vin', []))
+            outputs_count = len(tx.get('vout', []))
+            
+            if inputs_count == 0:
+                inputs_count = len(tx.get('inputs', []))
+            if outputs_count == 0:
+                outputs_count = len(tx.get('out', []))
+            
+            # CoinJoin: many inputs and many outputs with similar counts
+            if inputs_count >= 10 and outputs_count >= 10:
+                ratio = max(inputs_count, outputs_count) / min(inputs_count, outputs_count)
+                if ratio < 1.2:  # Counts are similar
+                    return True
+            
+            return False
+        except:
+            return False
+
+    def _should_skip_transaction(self, tx: Dict[str, Any]) -> bool:
+        """
+        Skip transactions that break analysis chains.
+        Uses thresholds from config.py for flexibility.
+        """
+        try:
+            # Validate input
+            if not isinstance(tx, dict):
+                return False
+            
+            # Get input/output counts
+            inputs_count = len(tx.get('vin', []))
+            outputs_count = len(tx.get('vout', []))
+            
+            if inputs_count == 0:
+                inputs_count = len(tx.get('inputs', []))
+            if outputs_count == 0:
+                outputs_count = len(tx.get('out', []))
+            
+            # FILTER 1: Extreme mixers (both sides massive)
+            if inputs_count >= SKIP_MIXER_INPUT_THRESHOLD and outputs_count >= SKIP_MIXER_OUTPUT_THRESHOLD:
+                print(f"    [SKIP] Extreme mixer: {inputs_count} in â†’ {outputs_count} out")
+                return True
+            
+            # FILTER 2: Distribution/Airdrop transactions (CRITICAL!)
+            if inputs_count <= SKIP_DISTRIBUTION_MAX_INPUTS and outputs_count >= SKIP_DISTRIBUTION_MIN_OUTPUTS:
+                print(f"    [SKIP] Airdrop/Distribution: {inputs_count} in â†’ {outputs_count} out")
+                return True
+            
+            # FILTER 3: CoinJoin patterns
+            if self._is_coinjoin(tx):
+                print(f"    [SKIP] CoinJoin detected")
+                return True
+            
+            return False
+        
+        except Exception as e:
+            print(f"    [ERROR] Exception in _should_skip_transaction: {e}")
+            return False
+
+    async def get_address_txs(self, address: str,
+                             start_block: Optional[int] = None,
+                             end_block: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Fetch transactions with smart filtering"""
+        block_range = (start_block, end_block) if (start_block or end_block) else None
+
+        # Try to get from cache FIRST
+        cached = self.cache.get_cached(address, block_range)
+        if cached:
+            return cached
+
+        print(f"[*] Fetching: {address}")
+        txs = await self.api.get_address_transactions(address, start_block, end_block)
+
+        # Validate txs is a list
+        if not isinstance(txs, list):
+            print(f"  [WARN] API returned non-list: {type(txs)}")
+            return []
+
+        filtered_txs = []
+        
+        # Apply all smart filters
+        for tx in txs:
+            # Skip if not a dict
+            if not isinstance(tx, dict):
+                continue
+            
+            # Skip if should be filtered
+            try:
+                if self._should_skip_transaction(tx):
+                    continue
+            except Exception as e:
+                print(f"    [ERROR] Error checking transaction: {e}")
+                # On error, include the transaction (safe default)
+                pass
+            
+            filtered_txs.append(tx)
+        
+        # Limit to MAX_TRANSACTIONS_PER_ADDRESS
+        if hasattr(self, 'max_tx_per_address'):
+            filtered_txs = filtered_txs[:self.max_tx_per_address]
+
+        # Cache the filtered results using .store() method
+        if filtered_txs:
+            try:
+                self.cache.store(address, filtered_txs, block_range)
+            except Exception as e:
+                print(f"  [WARN] Error caching: {e}")
+
+        return filtered_txs
 
     async def find_connection(self, list_a: List[str], list_b: List[str],
                             max_depth: int = 5,
                             start_block: Optional[int] = None,
                             end_block: Optional[int] = None,
                             progress_callback=None) -> Dict[str, Any]:
-        """Bulletproof bidirectional BFS from scratch"""
-        
-        results = {
-            'connections_found': [],
-            'search_depth': max_depth,
-            'total_addresses_examined': 0,
-            'block_range': (start_block, end_block),
-            'status': 'searching'
-        }
+        """Fresh trace - calls find_connection_with_visited_state with empty state"""
+        return await self.find_connection_with_visited_state(
+            list_a, list_b, max_depth, start_block, end_block,
+            visited_forward=None,
+            visited_backward=None,
+            queued_forward=None,
+            queued_backward=None,
+            progress_callback=progress_callback
+        )
 
-        print(f"\n[LINK] Linking {len(list_a)} addresses with {len(list_b)} addresses")
-        print(f" Max Depth: {max_depth}, Blocks: {start_block} - {end_block}\n")
 
-        # Quick check for immediate matches
-        immediate_matches = set(list_a) & set(list_b)
-        if immediate_matches:
-            matching_addr = immediate_matches.pop()
-            print(f"\n[âœ“] IMMEDIATE MATCH FOUND: {matching_addr}")
-            
-            results['connections_found'].append({
-                'source': matching_addr,
-                'target': matching_addr,
-                'path': [matching_addr],
-                'path_length': 1,
-                'path_count': 1,
-                'meeting_points': [matching_addr],
-                'found_at_depth': 0,
-                'direction': 'immediate'
-            })
-            results['status'] = 'connected'
-            results['total_addresses_examined'] = 2
-            results['visited_forward'] = {addr: [addr] for addr in list_a}
-            results['visited_backward'] = {addr: [addr] for addr in list_b}
-            results['queued_forward'] = []
-            results['queued_backward'] = []
-            return results
-
-        # Initialize queues with paths
-        forward_queue = deque([(addr, [addr]) for addr in list_a])
-        backward_queue = deque([(addr, [addr]) for addr in list_b])
-
-        # Store discovered addresses with their paths
-        forward_discovered = {addr: [addr] for addr in list_a}
-        forward_visited = set()
-
-        backward_discovered = {addr: [addr] for addr in list_b}
-        backward_visited = set()
-
-        # Alternating BFS
-        for current_depth in range(max_depth):
-            print(f"\n{'='*70}")
-            print(f"[DEPTH {current_depth}]")
-            print(f"{'='*70}")
-
-            # Forward step
-            print(f"\n[>>] Forward BFS (queue: {len(forward_queue)}):")
-            forward_queue_size = len(forward_queue)
-            addresses_explored = 0
-
-            for _ in range(forward_queue_size):
-                if not forward_queue:
-                    break
-
-                current, path = forward_queue.popleft()
-
-                if current in forward_visited:
-                    continue
-
-                forward_visited.add(current)
-                print(f"  Exploring: {current}")
-
-                if progress_callback:
-                    progress_callback({
-                        'visited': len(forward_visited) + len(backward_visited),
-                        'current': current,
-                        'direction': 'forward'   
-                    })
-
-                try:
-                    txs = await self.get_address_txs(current, start_block, end_block)
-
-                    neighbor_count = 0
-                    for tx in txs:
-                        outputs = self._extract_addresses(tx, 'output')
-                        inputs = self._extract_addresses(tx, 'input')
-                        neighbors = outputs | inputs
-
-                        for neighbor in neighbors:
-                            if neighbor in forward_discovered:
-                                continue
-
-                            new_path = path + [neighbor]
-
-                            # Check if meeting point
-                            if neighbor in backward_discovered:
-                                backward_path = backward_discovered[neighbor]
-                                full_path = new_path + list(reversed(backward_path[1:]))
-                                
-                                print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
-                                print(f" Path: {' -> '.join(full_path)}")
-                                
-                                results['connections_found'].append({
-                                    'source': full_path[0],
-                                    'target': full_path[-1],
-                                    'path': full_path,
-                                    'path_length': len(full_path),
-                                    'path_count': len(full_path),
-                                    'meeting_points': full_path,
-                                    'found_at_depth': current_depth,
-                                    'direction': 'forward_meets_backward'
-                                })
-                                results['status'] = 'connected'
-                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-                                results['visited_forward'] = forward_discovered
-                                results['visited_backward'] = backward_discovered
-                                results['queued_forward'] = [item[0] for item in list(forward_queue)]
-                                results['queued_backward'] = [item[0] for item in list(backward_queue)]
-                                return results
-
-                            forward_discovered[neighbor] = new_path
-                            forward_queue.append((neighbor, new_path))
-                            neighbor_count += 1
-
-                    addresses_explored += 1
-
-                except Exception as e:
-                    print(f"    Error: {e}")
-
-            print(f"  Forward explored {addresses_explored}, queue: {len(forward_queue)}")
-
-            # Backward step
-            print(f"\n[<<] Backward BFS (queue: {len(backward_queue)}):")
-            backward_queue_size = len(backward_queue)
-            addresses_explored = 0
-
-            for _ in range(backward_queue_size):
-                if not backward_queue:
-                    break
-
-                current, path = backward_queue.popleft()
-
-                if current in backward_visited:
-                    continue
-
-                backward_visited.add(current)
-                print(f"  Exploring: {current}")
-
-                if progress_callback:
-                    progress_callback({
-                        'visited': len(forward_visited) + len(backward_visited),
-                        'current': current,
-                        'direction': 'backward'   
-                    })
-
-                try:
-                    txs = await self.get_address_txs(current, start_block, end_block)
-
-                    neighbor_count = 0
-                    for tx in txs:
-                        inputs = self._extract_addresses(tx, 'input')
-                        outputs = self._extract_addresses(tx, 'output')
-                        neighbors = inputs | outputs
-
-                        for neighbor in neighbors:
-                            if neighbor in backward_discovered:
-                                continue
-
-                            new_path = path + [neighbor]
-
-                            # Check if meeting point
-                            if neighbor in forward_discovered:
-                                forward_path = forward_discovered[neighbor]
-                                full_path = forward_path + list(reversed(new_path[1:]))
-                                
-                                print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
-                                print(f" Path: {' -> '.join(full_path)}")
-                                
-                                results['connections_found'].append({
-                                    'source': full_path[0],
-                                    'target': full_path[-1],
-                                    'path': full_path,
-                                    'path_length': len(full_path),
-                                    'path_count': len(full_path),
-                                    'meeting_points': full_path,
-                                    'found_at_depth': current_depth,
-                                    'direction': 'backward_meets_forward'
-                                })
-                                results['status'] = 'connected'
-                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-                                results['visited_forward'] = forward_discovered
-                                results['visited_backward'] = backward_discovered
-                                results['queued_forward'] = [item[0] for item in list(forward_queue)]
-                                results['queued_backward'] = [item[0] for item in list(backward_queue)]
-                                return results
-
-                            backward_discovered[neighbor] = new_path
-                            backward_queue.append((neighbor, new_path))
-                            neighbor_count += 1
-
-                    addresses_explored += 1
-
-                except Exception as e:
-                    print(f"    Error: {e}")
-
-            print(f"  Backward explored {addresses_explored}, queue: {len(backward_queue)}")
-
-            print(f"\n[STATUS] Depth {current_depth}:")
-            print(f" Forward: visited={len(forward_visited)}, discovered={len(forward_discovered)}, queue={len(forward_queue)}")
-            print(f" Backward: visited={len(backward_visited)}, discovered={len(backward_discovered)}, queue={len(backward_queue)}")
-
-            if not forward_queue and not backward_queue:
-                print(f"\n[!] Both queues exhausted at depth {current_depth}")
-                break
-
-        # No connection found
-        results['status'] = 'no_connection'
-        results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-        results['visited_forward'] = forward_discovered
-        results['visited_backward'] = backward_discovered
-        results['queued_forward'] = [item[0] for item in list(forward_queue)]
-        results['queued_backward'] = [item[0] for item in list(backward_queue)]
-
-        print(f"\n[âœ—] No connection found")
-        print(f" Total addresses examined: {results['total_addresses_examined']}")
-        
-        return results
     async def find_connection_with_visited_state(self, list_a: List[str], list_b: List[str],
                                                 max_depth: int = 5,
                                                 start_block: Optional[int] = None,
@@ -481,11 +253,6 @@ class BitcoinAddressLinker:
         else:
             print(f" No queued addresses (will rebuild from discovered)\n")
 
-        # CRITICAL FIX: 
-        # - discovered_forward = all found addresses (for meeting-point detection)
-        # - visited_forward = addresses already fully explored (to skip them)
-        # - queue = addresses that still need to be explored
-        
         # Initialize visited as EMPTY (will be filled as we explore)
         forward_visited = set()
         forward_discovered = dict(visited_forward_dict)
@@ -526,63 +293,85 @@ class BitcoinAddressLinker:
             print(f"[DEPTH {current_depth}]")
             print(f"{'='*70}")
 
-            # Forward step
+            # Forward step - ONLY FOLLOW OUTPUTS
             print(f"\n[>>] Forward BFS (queue: {len(forward_queue)}):")
             forward_queue_size = len(forward_queue)
             addresses_explored = 0
 
-        # Forward BFS Step (money flowing FROM source TOWARD target)
-        # Follow OUTPUTS only - find who receives money FROM this address
+            for _ in range(forward_queue_size):
+                if not forward_queue:
+                    break
 
-        for _ in range(forward_queue_size):
-            if not forward_queue:
-                break
+                current, path = forward_queue.popleft()
 
-            current, path = forward_queue.popleft()
+                # Skip if already visited in THIS SEARCH SESSION
+                if current in forward_visited:
+                    continue
 
-            if current in forward_visited:
-                continue
+                forward_visited.add(current)
+                print(f"  Exploring: {current}")
 
-            forward_visited.add(current)
-            print(f"  Exploring: {current}")
+                if progress_callback:
+                    progress_callback({
+                        'visited': len(forward_visited) + len(backward_visited),
+                        'current': current,
+                        'direction': 'forward'   
+                    })
 
-            try:
-                txs = await self.get_address_txs(current, start_block, end_block)
+                try:
+                    txs = await self.get_address_txs(current, start_block, end_block)
 
-                for tx in txs:
-                    # FORWARD direction: Only follow OUTPUTS
-                    # Who did this address send money TO?
-                    outputs = self._extract_addresses(tx, 'output')
-                    
-                    for neighbor in outputs:
-                        if neighbor in forward_discovered:
-                            continue
+                    for tx in txs:
+                        # FORWARD direction: Only follow OUTPUTS
+                        # Who did this address send money TO?
+                        outputs = self._extract_addresses(tx, 'output')
+                        
+                        for neighbor in outputs:
+                            if neighbor in forward_discovered:
+                                continue
 
-                        new_path = path + [neighbor]
+                            new_path = path + [neighbor]
 
-                        # Check if meeting point
-                        if neighbor in backward_discovered:
-                            backward_path = backward_discovered[neighbor]
-                            full_path = new_path + list(reversed(backward_path[1:]))
-                            
-                            print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
-                            # ... return results ...
+                            # Check if meeting point
+                            if neighbor in backward_discovered:
+                                backward_path = backward_discovered[neighbor]
+                                full_path = new_path + list(reversed(backward_path[1:]))
+                                
+                                print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
+                                print(f" Path: {' -> '.join(full_path)}")
+                                
+                                results['connections_found'].append({
+                                    'source': full_path[0],
+                                    'target': full_path[-1],
+                                    'path': full_path,
+                                    'path_length': len(full_path),
+                                    'path_count': len(full_path),
+                                    'meeting_points': full_path,
+                                    'found_at_depth': current_depth,
+                                    'direction': 'forward_meets_backward'
+                                })
+                                results['status'] = 'connected'
+                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
+                                results['visited_forward'] = forward_discovered
+                                results['visited_backward'] = backward_discovered
+                                results['queued_forward'] = [item[0] for item in list(forward_queue)]
+                                results['queued_backward'] = [item[0] for item in list(backward_queue)]
+                                return results
 
-                        forward_discovered[neighbor] = new_path
-                        forward_queue.append((neighbor, new_path))
+                            forward_discovered[neighbor] = new_path
+                            forward_queue.append((neighbor, new_path))
 
-            except Exception as e:
-                print(f"    Error: {e}")
+                    addresses_explored += 1
+
+                except Exception as e:
+                    print(f"    Error: {e}")
 
             print(f"  Forward explored {addresses_explored}, queue: {len(forward_queue)}")
 
-            # Backward step
+            # Backward step - ONLY FOLLOW INPUTS
             print(f"\n[<<] Backward BFS (queue: {len(backward_queue)}):")
             backward_queue_size = len(backward_queue)
             addresses_explored = 0
-
-            # Backward BFS Step (money flowing FROM target TOWARD source)
-            # Follow INPUTS only - find who SENT money TO this address
 
             for _ in range(backward_queue_size):
                 if not backward_queue:
@@ -590,11 +379,19 @@ class BitcoinAddressLinker:
 
                 current, path = backward_queue.popleft()
 
+                # Skip if already visited in THIS SEARCH SESSION
                 if current in backward_visited:
                     continue
 
                 backward_visited.add(current)
                 print(f"  Exploring: {current}")
+
+                if progress_callback:
+                    progress_callback({
+                        'visited': len(forward_visited) + len(backward_visited),
+                        'current': current,
+                        'direction': 'backward'   
+                    })
 
                 try:
                     txs = await self.get_address_txs(current, start_block, end_block)
@@ -616,10 +413,30 @@ class BitcoinAddressLinker:
                                 full_path = forward_path + list(reversed(new_path[1:]))
                                 
                                 print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
-                                # ... return results ...
+                                print(f" Path: {' -> '.join(full_path)}")
+                                
+                                results['connections_found'].append({
+                                    'source': full_path[0],
+                                    'target': full_path[-1],
+                                    'path': full_path,
+                                    'path_length': len(full_path),
+                                    'path_count': len(full_path),
+                                    'meeting_points': full_path,
+                                    'found_at_depth': current_depth,
+                                    'direction': 'backward_meets_forward'
+                                })
+                                results['status'] = 'connected'
+                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
+                                results['visited_forward'] = forward_discovered
+                                results['visited_backward'] = backward_discovered
+                                results['queued_forward'] = [item[0] for item in list(forward_queue)]
+                                results['queued_backward'] = [item[0] for item in list(backward_queue)]
+                                return results
 
                             backward_discovered[neighbor] = new_path
                             backward_queue.append((neighbor, new_path))
+
+                    addresses_explored += 1
 
                 except Exception as e:
                     print(f"    Error: {e}")

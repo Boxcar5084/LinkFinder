@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
+"""
+Checkpoint Manager - Handles resumable session state
+"""
 
 import json
 import pickle
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 import uuid
 from config import CHECKPOINT_DIR
+
 
 class CheckpointManager:
     """Manages query checkpoints for resumable sessions"""
@@ -15,15 +19,69 @@ class CheckpointManager:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True)
 
+    def _convert_to_serializable(self, obj: Any) -> Any:
+        """Convert sets and other non-serializable types to serializable formats"""
+        if isinstance(obj, set):
+            return {'__set__': list(obj)}
+        elif isinstance(obj, dict):
+            return {k: self._convert_to_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self._convert_to_serializable(item) for item in obj]
+        else:
+            return obj
+
+    def _convert_from_serializable(self, obj: Any) -> Any:
+        """
+        Recursively convert serialized data back to original types.
+        Handles: dicts, lists, tuples, sets (marked as {'__set__': [...]})
+        """
+        if obj is None:
+            return obj
+        
+        if isinstance(obj, dict):
+            # Check for set marker (must be only key)
+            if len(obj) == 1 and '__set__' in obj:
+                items = obj['__set__']
+                if isinstance(items, list):
+                    return set(items)
+                return set([items])
+            
+            # Otherwise recurse into dict
+            return {
+                k: self._convert_from_serializable_complete(v) 
+                for k, v in obj.items()
+            }
+        
+        elif isinstance(obj, list):
+            # Recurse into list items
+            return [
+                self._convert_from_serializable_complete(item)
+                for item in obj
+            ]
+        
+        elif isinstance(obj, tuple):
+            # Recurse into tuple items, maintain tuple type
+            return tuple(
+                self._convert_from_serializable_complete(item)
+                for item in obj
+            )
+        
+        else:
+            # Primitive type, return as-is
+            return obj
+
     def create_checkpoint(self, session_id: str, state: Dict[str, Any]) -> str:
-        """Create and save checkpoint"""
+        """Create and save checkpoint with proper data type handling"""
         checkpoint_id = str(uuid.uuid4())
         checkpoint_file = self.checkpoint_dir / f"{session_id}_{checkpoint_id}.pkl"
+
+        # Convert state to serializable format
+        serializable_state = self._convert_to_serializable(state)
 
         checkpoint_data = {
             'timestamp': datetime.now().isoformat(),
             'session_id': session_id,
-            'state': state
+            'state': serializable_state
         }
 
         with open(checkpoint_file, 'wb') as f:
@@ -33,7 +91,7 @@ class CheckpointManager:
         return checkpoint_id
 
     def load_checkpoint(self, session_id: str, checkpoint_id: str) -> Optional[Dict[str, Any]]:
-        """Load checkpoint by ID"""
+        """Load checkpoint by ID and restore data types"""
         checkpoint_file = self.checkpoint_dir / f"{session_id}_{checkpoint_id}.pkl"
 
         if not checkpoint_file.exists():
@@ -42,7 +100,12 @@ class CheckpointManager:
 
         try:
             with open(checkpoint_file, 'rb') as f:
-                return pickle.load(f)
+                checkpoint_data = pickle.load(f)
+
+            # Convert state back from serializable format
+            checkpoint_data['state'] = self._convert_from_serializable(checkpoint_data['state'])
+            
+            return checkpoint_data
         except Exception as e:
             print(f"[ERR] Failed to load checkpoint: {e}")
             return None
@@ -56,12 +119,13 @@ class CheckpointManager:
             try:
                 with open(checkpoint_file, 'rb') as f:
                     data = pickle.load(f)
-                    checkpoints.append({
-                        'checkpoint_id': data['state'].get('checkpoint_id',
-                                                           checkpoint_file.stem.split('_', 1)[1]),
-                        'timestamp': data['timestamp'],
-                        'session_id': data['session_id']
-                    })
+
+                checkpoints.append({
+                    'checkpoint_id': data['state'].get('checkpoint_id',
+                                                      checkpoint_file.stem.split('_', 1)[1]),
+                    'timestamp': data['timestamp'],
+                    'session_id': data['session_id']
+                })
             except Exception as e:
                 print(f"[WARN] Failed to load checkpoint {checkpoint_file}: {e}")
                 continue
@@ -83,16 +147,17 @@ class CheckpointManager:
             try:
                 with open(checkpoint_file, 'rb') as f:
                     data = pickle.load(f)
-                    session_id = data.get('session_id')
-                    timestamp = datetime.fromisoformat(data.get('timestamp', ''))
-                    checkpoint_id = checkpoint_file.stem.split('_', 1)[1]  # Extract from filename
 
-                    all_checkpoints.append({
-                        'session_id': session_id,
-                        'checkpoint_id': checkpoint_id,
-                        'timestamp': timestamp,
-                        'data': data
-                    })
+                session_id = data.get('session_id')
+                timestamp = datetime.fromisoformat(data.get('timestamp', ''))
+                checkpoint_id = checkpoint_file.stem.split('_', 1)[1]  # Extract from filename
+
+                all_checkpoints.append({
+                    'session_id': session_id,
+                    'checkpoint_id': checkpoint_id,
+                    'timestamp': timestamp,
+                    'data': data
+                })
             except Exception as e:
                 print(f"[WARN] Failed to load checkpoint {checkpoint_file}: {e}")
                 continue
