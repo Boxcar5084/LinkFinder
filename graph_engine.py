@@ -372,7 +372,9 @@ class BitcoinAddressLinker:
         
         results['visited_forward'] = forward_discovered
         results['visited_backward'] = backward_discovered
-        
+        results['queued_forward'] = list(forward_queue)  # ADD THIS LINE
+        results['queued_backward'] = list(backward_queue)  
+        # ADD THIS LINE
         return results
 
     async def find_connection_with_visited_state(self, list_a: List[str], list_b: List[str],
@@ -610,8 +612,12 @@ class BitcoinAddressLinker:
         results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
 
         print(f"\n[âœ—] No connection found")
+
         results['visited_forward'] = forward_discovered
         results['visited_backward'] = backward_discovered
+        results['queued_forward'] = list(forward_queue)  # ADD THIS LINE
+        results['queued_backward'] = list(backward_queue)  # ADD THIS LINE
+        
         return results
 
     # Legacy methods for backward compatibility
