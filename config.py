@@ -29,6 +29,19 @@ BLOCKCHAIN_API_URL = "https://blockchain.info"
 MEMPOOL_API_URL = "https://mempool.space/api"
 ELECTRS_LOCAL_URL = "http://localhost:50002"
 
+
+MIXER_INPUT_THRESHOLD = 30          # Min inputs to be considered "mixer-like"  100-100-50
+MIXER_OUTPUT_THRESHOLD = 30         # Min outputs to be considered "mixer-like"  50-50-20
+SUSPICIOUS_RATIO_THRESHOLD = 10     # Input:output or output:input ratio to flag  30-30-10
+
+# Transaction filtering thresholds
+SKIP_MIXER_INPUT_THRESHOLD = 50           # Min inputs for extreme mixer
+SKIP_MIXER_OUTPUT_THRESHOLD = 50          # Min outputs for extreme mixer
+
+# Airdrop/Distribution detection (MOST IMPORTANT!)
+SKIP_DISTRIBUTION_MAX_INPUTS = 2          # Max inputs to trigger filter
+SKIP_DISTRIBUTION_MIN_OUTPUTS = 100       # Min outputs to trigger filter
+
 MAX_TRANSACTIONS_PER_ADDRESS = 50
 MAX_DEPTH = 10
 CACHE_MAX_SIZE_MB = 2048

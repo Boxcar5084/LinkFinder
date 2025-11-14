@@ -173,7 +173,7 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
 
 async def _periodic_checkpoint_task(session_id: str):
     """Create checkpoints every 5 minutes while trace is running"""
-    CHECKPOINT_INTERVAL = 60  # 5 minutes in seconds
+    CHECKPOINT_INTERVAL = 300  # 5 minutes in seconds
     
     while True:
         try:
@@ -226,6 +226,8 @@ async def _periodic_checkpoint_task(session_id: str):
             print(f"[ERR] Error in periodic checkpoint: {e}")
             continue
 
+# CORRECTED BitcoinAddressLinkerWithCheckpoint class for main.py
+
 class BitcoinAddressLinkerWithCheckpoint:
     """Extended linker that updates session state for checkpointing AND loads from checkpoint"""
 
@@ -250,17 +252,26 @@ class BitcoinAddressLinkerWithCheckpoint:
             visited_forward = trace_state.get('visited_forward', {})
             visited_backward = trace_state.get('visited_backward', {})
             visited = trace_state.get('visited', set())
+            queued_forward = trace_state.get('queued_forward', [])  # GET QUEUED
+            queued_backward = trace_state.get('queued_backward', [])  # GET QUEUED
             
             print(f" Previously visited (forward): {len(visited_forward)} addresses")
             print(f" Previously visited (backward): {len(visited_backward)} addresses")
             print(f" Total visited: {len(visited)} addresses")
             print(f" Continuing trace...\n")
             
-            # Pass visited dictionaries to linker for resumption
+            # CRITICAL FIX: Pass queued addresses to linker for proper resumption
             result = await self.linker.find_connection_with_visited_state(
-                list_a, list_b, max_depth, start_block, end_block,
+                list_a, 
+                list_b, 
+                max_depth, 
+                start_block, 
+                end_block,
                 visited_forward=visited_forward,
-                visited_backward=visited_backward
+                visited_backward=visited_backward,
+                queued_forward=queued_forward,     # PASS QUEUED FORWARD
+                queued_backward=queued_backward,   # PASS QUEUED BACKWARD
+                progress_callback=self._progress_callback
             )
         else:
             # FRESH TRACE - call find_connection FIRST
@@ -274,8 +285,8 @@ class BitcoinAddressLinkerWithCheckpoint:
             'visited_forward': result.get('visited_forward', {}),
             'visited_backward': result.get('visited_backward', {}),
             'visited': result.get('visited', set()),
-            'queued_forward': result.get('queued_forward', []),  # ADD THIS
-            'queued_backward': result.get('queued_backward', []),  # ADD THIS
+            'queued_forward': result.get('queued_forward', []),  # SAVE QUEUED
+            'queued_backward': result.get('queued_backward', []),  # SAVE QUEUED
             'connections_found': result.get('connections_found', []),
             'search_depth': result.get('search_depth', max_depth),
             'status': result.get('status', 'searching')
