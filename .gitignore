@@ -2,4 +2,9 @@ blockchain_cache.db
 .DS_Store
 checkpoints/
 exports/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
 
