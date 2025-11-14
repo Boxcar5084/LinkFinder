@@ -175,7 +175,7 @@ with st.sidebar:
         st.rerun()
     
     st.divider()
-    st.info(f"API Timeout: {API_TIMEOUT}s\nRefresh: Every 20s (if enabled)")
+    st.info(f"API Timeout: {API_TIMEOUT}s\nRefresh: Every 60s (if enabled)")
     
     with st.expander("Debug Info"):
         st.write(f"API URL: {API_URL}")

@@ -200,6 +200,13 @@ class BitcoinAddressLinker:
                 forward_visited.add(current)
                 print(f"  Exploring: {current}")
 
+                if progress_callback:
+                    progress_callback({
+                        'visited': len(forward_visited) + len(backward_visited),
+                        'current': current,
+                        'direction': 'forward'   
+                    })
+
                 try:
                     txs = await self.get_address_txs(current, start_block, end_block)
                     print(f"    Found {len(txs)} transactions")
@@ -278,6 +285,13 @@ class BitcoinAddressLinker:
 
                 backward_visited.add(current)
                 print(f"  Exploring: {current}")
+
+                if progress_callback:
+                        progress_callback({
+                            'visited': len(forward_visited) + len(backward_visited),
+                            'current': current,
+                            'direction': 'backward'
+                        })
 
                 try:
                     txs = await self.get_address_txs(current, start_block, end_block)
@@ -447,6 +461,13 @@ class BitcoinAddressLinker:
                 forward_visited.add(current)
                 print(f"  Exploring: {current}")
 
+                if progress_callback:
+                    progress_callback({
+                        'visited': len(forward_visited) + len(backward_visited),
+                        'current': current,
+                        'direction': 'forward'   
+                    })
+
                 try:
                     txs = await self.get_address_txs(current, start_block, end_block)
                     print(f"    Found {len(txs)} transactions")
@@ -516,6 +537,13 @@ class BitcoinAddressLinker:
 
                 backward_visited.add(current)
                 print(f"  Exploring: {current}")
+
+                if progress_callback:
+                    progress_callback({
+                        'visited': len(forward_visited) + len(backward_visited),
+                        'current': current,
+                        'direction': 'backward'   
+                    })
 
                 try:
                     txs = await self.get_address_txs(current, start_block, end_block)

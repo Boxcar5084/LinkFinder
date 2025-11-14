@@ -197,17 +197,17 @@ async def _periodic_checkpoint_task(session_id: str):
                 'session_id': session_id,
                 'request': sessions[session_id].get('request'),
                 'trace_state': {
-                    'visited_forward': visited_forward,  # Dict with actual address->path data
-                    'visited_backward': visited_backward,  # Dict with actual address->path data
-                    'visited': list(visited) if isinstance(visited, set) else visited,  # Convert set to list for JSON
-                    'connections_found': connections_found
+                    'visited_forward': list(trace_state.get('visited_forward', set())),  # Convert set to list
+                    'visited_backward': list(trace_state.get('visited_backward', set())),  # Convert set to list
+                    'visited': list(trace_state.get('visited', set())),  # Convert set to list
+                    'connections_found': trace_state.get('connections_found', [])
                 },
                 'periodic_checkpoint': True,
                 'checkpoint_time': datetime.now().isoformat(),
                 'progress': {
-                    'addresses_examined': len(visited),
-                    'visited_forward': len(visited_forward),
-                    'visited_backward': len(visited_backward),
+                    'addresses_examined': len(trace_state.get('visited', set())),
+                    'visited_forward': len(trace_state.get('visited_forward', set())),
+                    'visited_backward': len(trace_state.get('visited_backward', set())),
                 }
             }
             
@@ -298,20 +298,19 @@ class BitcoinAddressLinkerWithCheckpoint:
         current = progress.get('current', '')
         direction = progress.get('direction', 'forward')
         
-        # Add to visited
+        # Add to visited SET (not dict)
         if 'visited' not in session['trace_state']:
             session['trace_state']['visited'] = set()
+        
         session['trace_state']['visited'].add(current)
         
-        # Add to directional visited
+        # Add to directional visited SET  
         if direction == 'forward':
             if 'visited_forward' not in session['trace_state']:
-                session['trace_state']['visited_forward'] = {}
-            session['trace_state']['visited_forward'][current] = True
+                session['trace_state']['visited_forward'].add(current)
         else:
             if 'visited_backward' not in session['trace_state']:
-                session['trace_state']['visited_backward'] = {}
-            session['trace_state']['visited_backward'][current] = True
+                session['trace_state']['visited_backward'].add(current)
 
 
 @app.get("/status/{session_id}")
