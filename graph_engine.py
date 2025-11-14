@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 
 """
-BULLETPROOF BIDIRECTIONAL BFS WITH COMPLETE DISCOVERY CHECK
+BULLETPROOF BIDIRECTIONAL BFS WITH CHECKPOINT RESUME
 Checks discovered addresses against BOTH visited AND queued from opposite direction.
 This guarantees NO connections are missed, even if they're in the queue waiting to be explored.
+Supports resuming from checkpoints with proper set handling.
 """
 
 import asyncio
-from typing import Set, Dict, List, Tuple, Optional, Any
+from typing import Set, Dict, List, Tuple, Optional, Any, Union
 from collections import deque
 from api_provider import APIProvider
 from cache_manager import TransactionCache
@@ -112,21 +113,23 @@ class BitcoinAddressLinker:
 
         return addresses
 
+    def _ensure_set(self, value: Union[Set, List, Dict]) -> Set:
+        """Convert any collection type to set"""
+        if isinstance(value, set):
+            return value
+        elif isinstance(value, list):
+            return set(value)
+        elif isinstance(value, dict):
+            return set(value.keys())
+        else:
+            return set()
+
     async def find_connection(self, list_a: List[str], list_b: List[str],
                             max_depth: int = 5,
                             start_block: Optional[int] = None,
                             end_block: Optional[int] = None,
                             progress_callback=None) -> Dict[str, Any]:
-        """
-        BULLETPROOF BIDIRECTIONAL BFS
-        
-        Key: When discovering a new neighbor, check if it exists in:
-        1. backward_visited (already explored)
-        2. backward_all_discovered (includes queued but not yet explored)
-        
-        This ensures we catch meetings even if the address is queued but hasn't
-        been explored yet by the opposite direction.
-        """
+        """Bulletproof bidirectional BFS from scratch"""
         
         results = {
             'connections_found': [],
@@ -137,15 +140,13 @@ class BitcoinAddressLinker:
         }
 
         print(f"\n[LINK] Linking {len(list_a)} addresses with {len(list_b)} addresses")
-        print(f" Max Depth: {max_depth}, Blocks: {start_block} - {end_block}")
-        print(f" Strategy: Bulletproof Bidirectional BFS (checks visited + queued)\n")
+        print(f" Max Depth: {max_depth}, Blocks: {start_block} - {end_block}\n")
 
         # Quick check for immediate matches
         immediate_matches = set(list_a) & set(list_b)
         if immediate_matches:
             matching_addr = immediate_matches.pop()
             print(f"\n[âœ“] IMMEDIATE MATCH FOUND: {matching_addr}")
-            print(f" Path: {matching_addr}")
             
             results['connections_found'].append({
                 'source': matching_addr,
@@ -159,288 +160,24 @@ class BitcoinAddressLinker:
             })
             results['status'] = 'connected'
             results['total_addresses_examined'] = 2
-            results['visited_forward'] = forward_discovered
-            results['visited_backward'] = backward_discovered
+            results['visited_forward'] = {addr: [addr] for addr in list_a}
+            results['visited_backward'] = {addr: [addr] for addr in list_b}
+            results['queued_forward'] = []
+            results['queued_backward'] = []
             return results
 
-        # Initialize separate queues and visited dictionaries
+        # Initialize queues with paths
         forward_queue = deque([(addr, [addr]) for addr in list_a])
         backward_queue = deque([(addr, [addr]) for addr in list_b])
 
-        # Store both visited addresses and paths
+        # Store discovered addresses with their paths
         forward_discovered = {addr: [addr] for addr in list_a}
-        forward_visited = set()  # START EMPTY! ← FIX
+        forward_visited = set()
 
-        # Same for backward
         backward_discovered = {addr: [addr] for addr in list_b}
-        backward_visited = set()  # START EMPTY! ← FIX
+        backward_visited = set()
 
-        # ALTERNATING BFS: One step forward, one step backward, repeat
-        for current_depth in range(max_depth):
-            print(f"\n{'='*70}")
-            print(f"[DEPTH {current_depth}]")
-            print(f"{'='*70}")
-
-            # ===== FORWARD STEP =====
-            print(f"\n[>>] Forward BFS (queue: {len(forward_queue)}):")
-            
-            forward_queue_size = len(forward_queue)
-            addresses_explored_this_level = 0
-
-            for _ in range(forward_queue_size):
-                if not forward_queue:
-                    break
-
-                current, path = forward_queue.popleft()
-
-                # Skip if somehow already visited (shouldn't happen in normal operation)
-                if current in forward_visited:
-                    continue
-
-                forward_visited.add(current)
-                print(f"  Exploring: {current}")
-
-                if progress_callback:
-                    progress_callback({
-                        'visited': len(forward_visited) + len(backward_visited),
-                        'current': current,
-                        'direction': 'forward'   
-                    })
-
-                try:
-                    txs = await self.get_address_txs(current, start_block, end_block)
-                    print(f"    Found {len(txs)} transactions")
-
-                    neighbor_count = 0
-                    for tx in txs:
-                        outputs = self._extract_addresses(tx, 'output')
-                        inputs = self._extract_addresses(tx, 'input')
-                        neighbors = outputs | inputs
-
-                        for neighbor in neighbors:
-                            # Skip if already discovered in forward direction
-                            if neighbor in forward_discovered:
-                                continue
-
-                            new_path = path + [neighbor]
-
-                            # *** CRITICAL: CHECK AGAINST ALL DISCOVERED FROM OPPOSITE DIRECTION ***
-                            if neighbor in backward_discovered:
-                                # MEETING POINT FOUND!
-                                backward_path = backward_discovered[neighbor]
-                                full_path = new_path + list(reversed(backward_path[1:]))
-                                
-                                print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
-                                print(f"    (In backward {'visited' if neighbor in backward_visited else 'queue'})")
-                                print(f" Path: {' -> '.join(full_path)}")
-                                
-                                results['connections_found'].append({
-                                    'source': full_path[0],
-                                    'target': full_path[-1],
-                                    'path': full_path,
-                                    'path_length': len(full_path),
-                                    'path_count': len(full_path),
-                                    'meeting_points': full_path,
-                                    'found_at_depth': current_depth,
-                                    'direction': 'forward_meets_backward'
-                                })
-                                results['status'] = 'connected'
-                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-
-                                print(f" Total addresses examined: {results['total_addresses_examined']}")
-                                
-                                results['visited_forward'] = forward_discovered
-                                results['visited_backward'] = backward_discovered   
-                                
-                                return results
-
-                            # Add to discovered and queue
-                            forward_discovered[neighbor] = new_path
-                            forward_queue.append((neighbor, new_path))
-                            neighbor_count += 1
-
-                    print(f"    Added {neighbor_count} new neighbors")
-                    addresses_explored_this_level += 1
-
-                except Exception as e:
-                    print(f"    Error: {e}")
-
-            print(f"  Forward explored {addresses_explored_this_level} addresses, queue now: {len(forward_queue)}")
-
-            # ===== BACKWARD STEP =====
-            print(f"\n[<<] Backward BFS (queue: {len(backward_queue)}):")
-            
-            backward_queue_size = len(backward_queue)
-            addresses_explored_this_level = 0
-
-            for _ in range(backward_queue_size):
-                if not backward_queue:
-                    break
-
-                current, path = backward_queue.popleft()
-
-                # Skip if somehow already visited
-                if current in backward_visited:
-                    continue
-
-                backward_visited.add(current)
-                print(f"  Exploring: {current}")
-
-                if progress_callback:
-                        progress_callback({
-                            'visited': len(forward_visited) + len(backward_visited),
-                            'current': current,
-                            'direction': 'backward'
-                        })
-
-                try:
-                    txs = await self.get_address_txs(current, start_block, end_block)
-                    print(f"    Found {len(txs)} transactions")
-
-                    neighbor_count = 0
-                    for tx in txs:
-                        inputs = self._extract_addresses(tx, 'input')
-                        outputs = self._extract_addresses(tx, 'output')
-                        neighbors = inputs | outputs
-
-                        for neighbor in neighbors:
-                            # Skip if already discovered in backward direction
-                            if neighbor in backward_discovered:
-                                continue
-
-                            new_path = path + [neighbor]
-
-                            # *** CRITICAL: CHECK AGAINST ALL DISCOVERED FROM OPPOSITE DIRECTION ***
-                            if neighbor in forward_discovered:
-                                # MEETING POINT FOUND!
-                                forward_path = forward_discovered[neighbor]
-                                full_path = forward_path + list(reversed(new_path[1:]))
-                                
-                                print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
-                                print(f"    (In forward {'visited' if neighbor in forward_visited else 'queue'})")
-                                print(f" Path: {' -> '.join(full_path)}")
-                                
-                                results['connections_found'].append({
-                                    'source': full_path[0],
-                                    'target': full_path[-1],
-                                    'path': full_path,
-                                    'path_length': len(full_path),
-                                    'path_count': len(full_path),
-                                    'meeting_points': full_path,
-                                    'found_at_depth': current_depth,
-                                    'direction': 'backward_meets_forward'
-                                })
-                                results['status'] = 'connected'
-                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-
-                                print(f" Total addresses examined: {results['total_addresses_examined']}")
-
-                                results['visited_forward'] = forward_discovered
-                                results['visited_backward'] = backward_discovered
-    
-                                return results
-
-                            # Add to discovered and queue
-                            backward_discovered[neighbor] = new_path
-                            backward_queue.append((neighbor, new_path))
-                            neighbor_count += 1
-
-                    print(f"    Added {neighbor_count} new neighbors")
-                    addresses_explored_this_level += 1
-
-                except Exception as e:
-                    print(f"    Error: {e}")
-
-            print(f"  Backward explored {addresses_explored_this_level} addresses, queue now: {len(backward_queue)}")
-
-            # Status
-            print(f"\n[STATUS] Depth {current_depth} complete:")
-            print(f" Forward   visited: {len(forward_visited)}, discovered: {len(forward_discovered)}, queue: {len(forward_queue)}")
-            print(f" Backward  visited: {len(backward_visited)}, discovered: {len(backward_discovered)}, queue: {len(backward_queue)}")
-
-            # If both queues empty, stop
-            if not forward_queue and not backward_queue:
-                print(f"\n[!] Both queues exhausted at depth {current_depth}")
-                break
-
-        # No connection found
-        results['status'] = 'no_connection'
-        results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-
-        print(f"\n[âœ—] No connection found within {max_depth} depth levels")
-        print(f" Total addresses examined: {results['total_addresses_examined']}")
-        
-        results['visited_forward'] = forward_discovered
-        results['visited_backward'] = backward_discovered
-        results['queued_forward'] = list(forward_queue)  # ADD THIS LINE
-        results['queued_backward'] = list(backward_queue)  
-        # ADD THIS LINE
-        return results
-
-    async def find_connection_with_visited_state(self, list_a: List[str], list_b: List[str],
-                                                max_depth: int = 5,
-                                                start_block: Optional[int] = None,
-                                                end_block: Optional[int] = None,
-                                                visited_forward: Dict[str, List[str]] = None,
-                                                visited_backward: Dict[str, List[str]] = None,
-                                                progress_callback=None) -> Dict[str, Any]:
-        """Find connections with checkpoint state, checking visited + queued."""
-
-        if visited_forward is None:
-            visited_forward = {addr: [addr] for addr in list_a}
-        if visited_backward is None:
-            visited_backward = {addr: [addr] for addr in list_b}
-
-        results = {
-            'connections_found': [],
-            'search_depth': max_depth,
-            'total_addresses_examined': len(visited_forward) + len(visited_backward),
-            'block_range': (start_block, end_block),
-            'status': 'searching'
-        }
-
-        print(f"\n[LINK] Linking {len(list_a)} addresses with {len(list_b)} addresses")
-        print(f" Max Depth: {max_depth}")
-        print(f" Resuming with {len(visited_forward)} + {len(visited_backward)} discovered\n")
-
-        # Quick check for immediate matches
-        immediate_matches = set(list_a) & set(list_b)
-        if immediate_matches:
-            matching_addr = immediate_matches.pop()
-            print(f"\n[âœ“] IMMEDIATE MATCH FOUND: {matching_addr}")
-            
-            results['connections_found'].append({
-                'source': matching_addr,
-                'target': matching_addr,
-                'path': [matching_addr],
-                'path_length': 1,
-                'path_count': 1,
-                'meeting_points': [matching_addr],
-                'found_at_depth': 0,
-                'direction': 'immediate'
-            })
-            results['status'] = 'connected'
-            results['total_addresses_examined'] = 2
-            results['visited_forward'] = forward_discovered
-            results['visited_backward'] = backward_discovered
-            return results
-
-        # Build initial queues from discovered addresses
-        forward_queue = deque()
-        for addr, path in visited_forward.items():
-            forward_queue.append((addr, path))
-        
-        forward_discovered = dict(visited_forward)  # Copy
-        forward_visited = set(visited_forward.keys())
-
-        backward_queue = deque()
-        for addr, path in visited_backward.items():
-            backward_queue.append((addr, path))
-        
-        backward_discovered = dict(visited_backward)  # Copy
-        backward_visited = set(visited_backward.keys())
-
-        # ALTERNATING BFS
+        # Alternating BFS
         for current_depth in range(max_depth):
             print(f"\n{'='*70}")
             print(f"[DEPTH {current_depth}]")
@@ -472,7 +209,6 @@ class BitcoinAddressLinker:
 
                 try:
                     txs = await self.get_address_txs(current, start_block, end_block)
-                    print(f"    Found {len(txs)} transactions")
 
                     neighbor_count = 0
                     for tx in txs:
@@ -486,12 +222,12 @@ class BitcoinAddressLinker:
 
                             new_path = path + [neighbor]
 
+                            # Check if meeting point
                             if neighbor in backward_discovered:
                                 backward_path = backward_discovered[neighbor]
                                 full_path = new_path + list(reversed(backward_path[1:]))
                                 
                                 print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
-                                print(f"    (In backward {'visited' if neighbor in backward_visited else 'queue'})")
                                 print(f" Path: {' -> '.join(full_path)}")
                                 
                                 results['connections_found'].append({
@@ -506,22 +242,22 @@ class BitcoinAddressLinker:
                                 })
                                 results['status'] = 'connected'
                                 results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-                                print(f" Total addresses examined: {results['total_addresses_examined']}")
                                 results['visited_forward'] = forward_discovered
                                 results['visited_backward'] = backward_discovered
+                                results['queued_forward'] = [item[0] for item in list(forward_queue)]
+                                results['queued_backward'] = [item[0] for item in list(backward_queue)]
                                 return results
 
                             forward_discovered[neighbor] = new_path
                             forward_queue.append((neighbor, new_path))
                             neighbor_count += 1
 
-                    print(f"    Added {neighbor_count} new neighbors")
                     addresses_explored += 1
 
                 except Exception as e:
                     print(f"    Error: {e}")
 
-            print(f"  Forward explored {addresses_explored}, queue now: {len(forward_queue)}")
+            print(f"  Forward explored {addresses_explored}, queue: {len(forward_queue)}")
 
             # Backward step
             print(f"\n[<<] Backward BFS (queue: {len(backward_queue)}):")
@@ -549,7 +285,233 @@ class BitcoinAddressLinker:
 
                 try:
                     txs = await self.get_address_txs(current, start_block, end_block)
-                    print(f"    Found {len(txs)} transactions")
+
+                    neighbor_count = 0
+                    for tx in txs:
+                        inputs = self._extract_addresses(tx, 'input')
+                        outputs = self._extract_addresses(tx, 'output')
+                        neighbors = inputs | outputs
+
+                        for neighbor in neighbors:
+                            if neighbor in backward_discovered:
+                                continue
+
+                            new_path = path + [neighbor]
+
+                            # Check if meeting point
+                            if neighbor in forward_discovered:
+                                forward_path = forward_discovered[neighbor]
+                                full_path = forward_path + list(reversed(new_path[1:]))
+                                
+                                print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
+                                print(f" Path: {' -> '.join(full_path)}")
+                                
+                                results['connections_found'].append({
+                                    'source': full_path[0],
+                                    'target': full_path[-1],
+                                    'path': full_path,
+                                    'path_length': len(full_path),
+                                    'path_count': len(full_path),
+                                    'meeting_points': full_path,
+                                    'found_at_depth': current_depth,
+                                    'direction': 'backward_meets_forward'
+                                })
+                                results['status'] = 'connected'
+                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
+                                results['visited_forward'] = forward_discovered
+                                results['visited_backward'] = backward_discovered
+                                results['queued_forward'] = [item[0] for item in list(forward_queue)]
+                                results['queued_backward'] = [item[0] for item in list(backward_queue)]
+                                return results
+
+                            backward_discovered[neighbor] = new_path
+                            backward_queue.append((neighbor, new_path))
+                            neighbor_count += 1
+
+                    addresses_explored += 1
+
+                except Exception as e:
+                    print(f"    Error: {e}")
+
+            print(f"  Backward explored {addresses_explored}, queue: {len(backward_queue)}")
+
+            print(f"\n[STATUS] Depth {current_depth}:")
+            print(f" Forward: visited={len(forward_visited)}, discovered={len(forward_discovered)}, queue={len(forward_queue)}")
+            print(f" Backward: visited={len(backward_visited)}, discovered={len(backward_discovered)}, queue={len(backward_queue)}")
+
+            if not forward_queue and not backward_queue:
+                print(f"\n[!] Both queues exhausted at depth {current_depth}")
+                break
+
+        # No connection found
+        results['status'] = 'no_connection'
+        results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
+        results['visited_forward'] = forward_discovered
+        results['visited_backward'] = backward_discovered
+        results['queued_forward'] = [item[0] for item in list(forward_queue)]
+        results['queued_backward'] = [item[0] for item in list(backward_queue)]
+
+        print(f"\n[âœ—] No connection found")
+        print(f" Total addresses examined: {results['total_addresses_examined']}")
+        
+        return results
+
+    async def find_connection_with_visited_state(self, list_a: List[str], list_b: List[str],
+                                                max_depth: int = 5,
+                                                start_block: Optional[int] = None,
+                                                end_block: Optional[int] = None,
+                                                visited_forward: Union[Dict, Set, List] = None,
+                                                visited_backward: Union[Dict, Set, List] = None,
+                                                progress_callback=None) -> Dict[str, Any]:
+        """Resume from checkpoint with proper type handling"""
+
+        # Convert all types to proper format
+        if visited_forward is None:
+            visited_forward_dict = {addr: [addr] for addr in list_a}
+        elif isinstance(visited_forward, dict):
+            visited_forward_dict = visited_forward
+        elif isinstance(visited_forward, (set, list)):
+            visited_forward_dict = {addr: [addr] for addr in visited_forward}
+        else:
+            visited_forward_dict = {addr: [addr] for addr in list_a}
+
+        if visited_backward is None:
+            visited_backward_dict = {addr: [addr] for addr in list_b}
+        elif isinstance(visited_backward, dict):
+            visited_backward_dict = visited_backward
+        elif isinstance(visited_backward, (set, list)):
+            visited_backward_dict = {addr: [addr] for addr in visited_backward}
+        else:
+            visited_backward_dict = {addr: [addr] for addr in list_b}
+
+        results = {
+            'connections_found': [],
+            'search_depth': max_depth,
+            'total_addresses_examined': len(visited_forward_dict) + len(visited_backward_dict),
+            'block_range': (start_block, end_block),
+            'status': 'searching'
+        }
+
+        print(f"\n[LINK] Linking {len(list_a)} addresses with {len(list_b)} addresses")
+        print(f" Max Depth: {max_depth}")
+        print(f" Resuming with {len(visited_forward_dict)} + {len(visited_backward_dict)} discovered\n")
+
+        # Initialize from checkpoint
+        forward_queue = deque([(addr, path) for addr, path in visited_forward_dict.items()])
+        forward_discovered = dict(visited_forward_dict)
+        forward_visited = set(visited_forward_dict.keys())
+
+        backward_queue = deque([(addr, path) for addr, path in visited_backward_dict.items()])
+        backward_discovered = dict(visited_backward_dict)
+        backward_visited = set(visited_backward_dict.keys())
+
+        # Alternating BFS
+        for current_depth in range(max_depth):
+            print(f"\n{'='*70}")
+            print(f"[DEPTH {current_depth}]")
+            print(f"{'='*70}")
+
+            # Forward step
+            print(f"\n[>>] Forward BFS (queue: {len(forward_queue)}):")
+            forward_queue_size = len(forward_queue)
+            addresses_explored = 0
+
+            for _ in range(forward_queue_size):
+                if not forward_queue:
+                    break
+
+                current, path = forward_queue.popleft()
+
+                if current in forward_visited:
+                    continue
+
+                forward_visited.add(current)
+                print(f"  Exploring: {current}")
+
+                if progress_callback:
+                    progress_callback({
+                        'visited': len(forward_visited) + len(backward_visited),
+                        'current': current,
+                        'direction': 'forward'   
+                    })
+
+                try:
+                    txs = await self.get_address_txs(current, start_block, end_block)
+
+                    neighbor_count = 0
+                    for tx in txs:
+                        outputs = self._extract_addresses(tx, 'output')
+                        inputs = self._extract_addresses(tx, 'input')
+                        neighbors = outputs | inputs
+
+                        for neighbor in neighbors:
+                            if neighbor in forward_discovered:
+                                continue
+
+                            new_path = path + [neighbor]
+
+                            if neighbor in backward_discovered:
+                                backward_path = backward_discovered[neighbor]
+                                full_path = new_path + list(reversed(backward_path[1:]))
+                                
+                                print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
+                                print(f" Path: {' -> '.join(full_path)}")
+                                
+                                results['connections_found'].append({
+                                    'source': full_path[0],
+                                    'target': full_path[-1],
+                                    'path': full_path,
+                                    'path_length': len(full_path),
+                                    'path_count': len(full_path),
+                                    'meeting_points': full_path,
+                                    'found_at_depth': current_depth,
+                                    'direction': 'forward_meets_backward'
+                                })
+                                results['status'] = 'connected'
+                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
+                                results['visited_forward'] = forward_discovered
+                                results['visited_backward'] = backward_discovered
+                                results['queued_forward'] = [item[0] for item in list(forward_queue)]
+                                results['queued_backward'] = [item[0] for item in list(backward_queue)]
+                                return results
+
+                            forward_discovered[neighbor] = new_path
+                            forward_queue.append((neighbor, new_path))
+                            neighbor_count += 1
+
+                    addresses_explored += 1
+
+                except Exception as e:
+                    print(f"    Error: {e}")
+
+            print(f"  Forward explored {addresses_explored}, queue: {len(forward_queue)}")
+
+            # Backward step
+            print(f"\n[<<] Backward BFS (queue: {len(backward_queue)}):")
+            backward_queue_size = len(backward_queue)
+            addresses_explored = 0
+
+            for _ in range(backward_queue_size):
+                if not backward_queue:
+                    break
+
+                current, path = backward_queue.popleft()
+
+                if current in backward_visited:
+                    continue
+
+                backward_visited.add(current)
+                print(f"  Exploring: {current}")
+
+                if progress_callback:
+                    progress_callback({
+                        'visited': len(forward_visited) + len(backward_visited),
+                        'current': current,
+                        'direction': 'backward'   
+                    })
+
+                try:
+                    txs = await self.get_address_txs(current, start_block, end_block)
 
                     neighbor_count = 0
                     for tx in txs:
@@ -568,7 +530,6 @@ class BitcoinAddressLinker:
                                 full_path = forward_path + list(reversed(new_path[1:]))
                                 
                                 print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
-                                print(f"    (In forward {'visited' if neighbor in forward_visited else 'queue'})")
                                 print(f" Path: {' -> '.join(full_path)}")
                                 
                                 results['connections_found'].append({
@@ -583,26 +544,26 @@ class BitcoinAddressLinker:
                                 })
                                 results['status'] = 'connected'
                                 results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-                                print(f" Total addresses examined: {results['total_addresses_examined']}")
                                 results['visited_forward'] = forward_discovered
                                 results['visited_backward'] = backward_discovered
+                                results['queued_forward'] = [item[0] for item in list(forward_queue)]
+                                results['queued_backward'] = [item[0] for item in list(backward_queue)]
                                 return results
 
                             backward_discovered[neighbor] = new_path
                             backward_queue.append((neighbor, new_path))
                             neighbor_count += 1
 
-                    print(f"    Added {neighbor_count} new neighbors")
                     addresses_explored += 1
 
                 except Exception as e:
                     print(f"    Error: {e}")
 
-            print(f"  Backward explored {addresses_explored}, queue now: {len(backward_queue)}")
+            print(f"  Backward explored {addresses_explored}, queue: {len(backward_queue)}")
 
-            print(f"\n[STATUS] Depth {current_depth} complete:")
-            print(f" Forward   visited: {len(forward_visited)}, discovered: {len(forward_discovered)}, queue: {len(forward_queue)}")
-            print(f" Backward  visited: {len(backward_visited)}, discovered: {len(backward_discovered)}, queue: {len(backward_queue)}")
+            print(f"\n[STATUS] Depth {current_depth}:")
+            print(f" Forward: visited={len(forward_visited)}, discovered={len(forward_discovered)}, queue={len(forward_queue)}")
+            print(f" Backward: visited={len(backward_visited)}, discovered={len(backward_discovered)}, queue={len(backward_queue)}")
 
             if not forward_queue and not backward_queue:
                 print(f"\n[!] Both queues exhausted")
@@ -610,101 +571,12 @@ class BitcoinAddressLinker:
 
         results['status'] = 'no_connection'
         results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-
-        print(f"\n[âœ—] No connection found")
-
         results['visited_forward'] = forward_discovered
         results['visited_backward'] = backward_discovered
-        results['queued_forward'] = list(forward_queue)  # ADD THIS LINE
-        results['queued_backward'] = list(backward_queue)  # ADD THIS LINE
+        results['queued_forward'] = [item[0] for item in list(forward_queue)]
+        results['queued_backward'] = [item[0] for item in list(backward_queue)]
+
+        print(f"\n[âœ—] No connection found")
+        print(f" Total addresses examined: {results['total_addresses_examined']}")
         
         return results
-
-    # Legacy methods for backward compatibility
-    async def trace_forward_with_path(self, address: str, max_depth: int = 5,
-                                     start_block: Optional[int] = None,
-                                     end_block: Optional[int] = None,
-                                     target_set: Optional[Set[str]] = None,
-                                     visited: Optional[Set[str]] = None,
-                                     progress_callback=None) -> Tuple[Set[str], bool, List[str]]:
-        """Legacy forward trace"""
-        if visited is None:
-            visited = set()
-
-        local_visited = set()
-        queue = deque([(address, 0, [address])])
-
-        while queue:
-            current, depth, path = queue.popleft()
-
-            if target_set and current in target_set:
-                visited.add(current)
-                local_visited.add(current)
-                return local_visited, True, path
-
-            if current in visited or current in local_visited or depth >= max_depth:
-                continue
-
-            local_visited.add(current)
-            visited.add(current)
-
-            try:
-                txs = await self.get_address_txs(current, start_block, end_block)
-                for tx in txs:
-                    outputs = self._extract_addresses(tx, 'output')
-                    inputs = self._extract_addresses(tx, 'input')
-                    for addr in outputs | inputs:
-                        if addr not in visited and addr not in local_visited:
-                            if target_set and addr in target_set:
-                                local_visited.add(addr)
-                                visited.add(addr)
-                                return local_visited, True, path + [addr]
-                            queue.append((addr, depth + 1, path + [addr]))
-            except:
-                pass
-
-        return local_visited, False, []
-
-    async def trace_backward_with_path(self, address: str, max_depth: int = 5,
-                                      start_block: Optional[int] = None,
-                                      end_block: Optional[int] = None,
-                                      target_set: Optional[Set[str]] = None,
-                                      visited: Optional[Set[str]] = None,
-                                      progress_callback=None) -> Tuple[Set[str], bool, List[str]]:
-        """Legacy backward trace"""
-        if visited is None:
-            visited = set()
-
-        local_visited = set()
-        queue = deque([(address, 0, [address])])
-
-        while queue:
-            current, depth, path = queue.popleft()
-
-            if target_set and current in target_set:
-                visited.add(current)
-                local_visited.add(current)
-                return local_visited, True, path
-
-            if current in visited or current in local_visited or depth >= max_depth:
-                continue
-
-            local_visited.add(current)
-            visited.add(current)
-
-            try:
-                txs = await self.get_address_txs(current, start_block, end_block)
-                for tx in txs:
-                    inputs = self._extract_addresses(tx, 'input')
-                    outputs = self._extract_addresses(tx, 'output')
-                    for addr in inputs | outputs:
-                        if addr not in visited and addr not in local_visited:
-                            if target_set and addr in target_set:
-                                local_visited.add(addr)
-                                visited.add(addr)
-                                return local_visited, True, path + [addr]
-                            queue.append((addr, depth + 1, path + [addr]))
-            except:
-                pass
-
-        return local_visited, False, []

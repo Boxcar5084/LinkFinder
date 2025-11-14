@@ -452,6 +452,9 @@ async def auto_resume():
     request_data = checkpoint_state.get('request', {})
     progress = checkpoint_state.get('progress', {})
     checkpoint_trace_state = checkpoint_state.get('trace_state', {})
+    visited_forward = set(checkpoint_data.get('visited_forward', []))
+    visited_backward = set(checkpoint_data.get('visited_backward', []))
+    visited = set(checkpoint_data.get('visited', []))
 
     print(f"\n[>>] Auto-resuming from session {session_id}")
     print(f" Checkpoint: {checkpoint_id}")
