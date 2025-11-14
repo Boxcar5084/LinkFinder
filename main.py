@@ -173,7 +173,7 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
 
 async def _periodic_checkpoint_task(session_id: str):
     """Create checkpoints every 5 minutes while trace is running"""
-    CHECKPOINT_INTERVAL = 300  # 5 minutes in seconds
+    CHECKPOINT_INTERVAL = 60  # 5 minutes in seconds
     
     while True:
         try:
@@ -290,7 +290,7 @@ class BitcoinAddressLinkerWithCheckpoint:
         return result
 
     def _progress_callback(self, progress):
-        """Callback to update trace state during search"""
+        """Update trace_state as progress is reported"""
         session = self.sessions.get(self.session_id)
         if not session or 'trace_state' not in session:
             return
@@ -298,19 +298,16 @@ class BitcoinAddressLinkerWithCheckpoint:
         current = progress.get('current', '')
         direction = progress.get('direction', 'forward')
         
-        # Add to visited SET (not dict)
-        if 'visited' not in session['trace_state']:
-            session['trace_state']['visited'] = set()
-        
+        # Add to visited set
         session['trace_state']['visited'].add(current)
         
-        # Add to directional visited SET  
+        # Track direction
         if direction == 'forward':
-            if 'visited_forward' not in session['trace_state']:
-                session['trace_state']['visited_forward'].add(current)
-        else:
-            if 'visited_backward' not in session['trace_state']:
-                session['trace_state']['visited_backward'].add(current)
+            session['trace_state']['visited_forward'].add(current)
+        elif direction == 'backward':
+            session['trace_state']['visited_backward'].add(current)
+
+
 
 
 @app.get("/status/{session_id}")
