@@ -48,21 +48,21 @@ class CheckpointManager:
             
             # Otherwise recurse into dict
             return {
-                k: self._convert_from_serializable_complete(v) 
+                k: self._convert_from_serializable(v) 
                 for k, v in obj.items()
             }
         
         elif isinstance(obj, list):
             # Recurse into list items
             return [
-                self._convert_from_serializable_complete(item)
+                self._convert_from_serializable(item)
                 for item in obj
             ]
         
         elif isinstance(obj, tuple):
             # Recurse into tuple items, maintain tuple type
             return tuple(
-                self._convert_from_serializable_complete(item)
+                self._convert_from_serializable(item)
                 for item in obj
             )
         
@@ -151,6 +151,10 @@ class CheckpointManager:
                 session_id = data.get('session_id')
                 timestamp = datetime.fromisoformat(data.get('timestamp', ''))
                 checkpoint_id = checkpoint_file.stem.split('_', 1)[1]  # Extract from filename
+
+                # Convert state back from serializable format
+                if 'state' in data:
+                    data['state'] = self._convert_from_serializable(data['state'])
 
                 all_checkpoints.append({
                     'session_id': session_id,

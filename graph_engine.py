@@ -26,6 +26,7 @@ class BitcoinAddressLinker:
         self.api = api_provider
         self.cache = cache_manager
         self.max_tx_per_address = max_tx_per_address
+        print(f"[GRAPH_ENGINE] Initialized with cache_manager: {cache_manager}")
 
     def _extract_addresses(self, tx: Dict[str, Any], direction: str = 'output') -> Set[str]:
         """Extract addresses from transaction"""
@@ -185,9 +186,15 @@ class BitcoinAddressLinker:
         # Cache the filtered results using .store() method
         if filtered_txs:
             try:
+                print(f"  [DEBUG] Attempting to cache {len(filtered_txs)} transactions for {address}")
                 self.cache.store(address, filtered_txs, block_range)
+                print(f"  [DEBUG] Cache store completed for {address}")
             except Exception as e:
                 print(f"  [WARN] Error caching: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print(f"  [DEBUG] No transactions to cache for {address} (filtered_txs is empty)")
 
         return filtered_txs
 
@@ -248,44 +255,80 @@ class BitcoinAddressLinker:
         print(f"\n[LINK] Linking {len(list_a)} addresses with {len(list_b)} addresses")
         print(f" Max Depth: {max_depth}")
         print(f" Resuming with {len(visited_forward_dict)} + {len(visited_backward_dict)} discovered")
-        if queued_forward or queued_backward:
-            print(f" Queued to process: {len(queued_forward or [])} forward, {len(queued_backward or [])} backward\n")
-        else:
-            print(f" No queued addresses (will rebuild from discovered)\n")
+        
+        # Normalize queued addresses - handle None, empty list, etc.
+        queued_forward = queued_forward if queued_forward is not None else []
+        queued_backward = queued_backward if queued_backward is not None else []
+        
+        print(f" Queued to process: {len(queued_forward)} forward, {len(queued_backward)} backward\n")
 
-        # Initialize visited as EMPTY (will be filled as we explore)
-        forward_visited = set()
+        # Initialize visited - addresses that were discovered AND explored (not in queue)
+        # Queued addresses were discovered but NOT yet explored, so exclude them from visited
+        queued_forward_set = set(queued_forward)
+        forward_visited = set(addr for addr in visited_forward_dict.keys() if addr not in queued_forward_set)
         forward_discovered = dict(visited_forward_dict)
         
-        # Initialize queues - if queued addresses provided, use those
-        # Otherwise, queue ALL discovered addresses (they haven't been explored yet)
+        # Initialize queues - if queued addresses provided, use those (they were discovered but not explored)
+        # Otherwise, continue from the most recently discovered addresses (they may have unexplored neighbors)
         forward_queue = deque()
-        if queued_forward:
-            print(f"[DEBUG] Loading {len(queued_forward)} queued forward addresses")
+        if len(queued_forward) > 0:
+            print(f"[DEBUG] Loading {len(queued_forward)} queued forward addresses (discovered but not yet explored)")
             for addr in queued_forward:
-                path = visited_forward_dict.get(addr, [addr])
+                if addr in visited_forward_dict:
+                    path = visited_forward_dict[addr]
+                else:
+                    # Address in queue but not in discovered - use address as path
+                    path = [addr]
                 forward_queue.append((addr, path))
+                print(f"[DEBUG]   Queued: {addr} (path length: {len(path)})")
         else:
-            # No queued addresses saved, so rebuild queue from discovered
-            print(f"[DEBUG] Rebuilding queue: queueing all {len(visited_forward_dict)} discovered forward addresses")
-            for addr, path in visited_forward_dict.items():
-                forward_queue.append((addr, path))
+            # No queued addresses saved - try to continue from recently discovered addresses
+            # Take the last N discovered addresses and re-queue them to explore their neighbors
+            print(f"[DEBUG] No queued addresses saved - continuing from recently discovered addresses")
+            print(f"[DEBUG] Total discovered: {len(visited_forward_dict)} addresses")
+            
+            # Get all discovered addresses (they were explored, but their neighbors might not be)
+            # Re-queue them to check for new neighbors
+            discovered_list = list(visited_forward_dict.items())
+            # Start with the most recently discovered (last in dict, though order isn't guaranteed)
+            # Actually, better: start from initial addresses and work outward
+            for addr in list_a:
+                if addr in visited_forward_dict:
+                    # Re-queue initial addresses to explore their neighbors again
+                    path = visited_forward_dict[addr]
+                    forward_queue.append((addr, path))
+                    forward_visited.discard(addr)  # Allow re-exploration
+                    print(f"[DEBUG]   Re-queuing initial address: {addr}")
+            
+            # If still no queue, take some discovered addresses
+            if len(forward_queue) == 0 and len(visited_forward_dict) > 0:
+                # Take up to 10 most recently discovered addresses
+                items = list(visited_forward_dict.items())[-10:]
+                for addr, path in items:
+                    forward_queue.append((addr, path))
+                    forward_visited.discard(addr)
+                    print(f"[DEBUG]   Re-queuing discovered address: {addr}")
 
         # Same for backward
-        backward_visited = set()
+        queued_backward_set = set(queued_backward) if queued_backward else set()
+        backward_visited = set(addr for addr in visited_backward_dict.keys() if addr not in queued_backward_set)
         backward_discovered = dict(visited_backward_dict)
         
         backward_queue = deque()
         if queued_backward:
-            print(f"[DEBUG] Loading {len(queued_backward)} queued backward addresses")
+            print(f"[DEBUG] Loading {len(queued_backward)} queued backward addresses (discovered but not yet explored)")
             for addr in queued_backward:
                 path = visited_backward_dict.get(addr, [addr])
                 backward_queue.append((addr, path))
         else:
-            # No queued addresses saved, so rebuild queue from discovered
-            print(f"[DEBUG] Rebuilding queue: queueing all {len(visited_backward_dict)} discovered backward addresses")
-            for addr, path in visited_backward_dict.items():
-                backward_queue.append((addr, path))
+            # No queued addresses saved - all discovered addresses were fully explored
+            # Start fresh from initial addresses to find new connections
+            print(f"[DEBUG] No queued addresses - all {len(visited_backward_dict)} discovered addresses were explored")
+            print(f"[DEBUG] Starting fresh from initial addresses to find new connections")
+            # Start from initial addresses - they may have new neighbors we haven't seen
+            for addr in list_b:
+                if addr not in backward_visited:
+                    backward_queue.append((addr, [addr]))
 
         # Alternating BFS
         for current_depth in range(max_depth):

@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import uuid
 import asyncio
+import sqlite3
 from datetime import datetime
 from api_provider import get_provider
 from graph_engine import BitcoinAddressLinker
@@ -15,10 +16,13 @@ from config import DEFAULT_API
 app = FastAPI(title="Bitcoin Address Linker")
 
 # Global state
+print("[MAIN] Initializing global services...")
 cache_manager = TransactionCache()
+print(f"[MAIN] Cache manager created: {cache_manager}")
 checkpoint_manager = CheckpointManager()
 export_manager = ExportManager()
 sessions = {}  # session_id -> {status, task, results, checkpoint_id, ...}
+print("[MAIN] Global services initialized")
 
 class TraceRequest(BaseModel):
     list_a: List[str]
@@ -62,8 +66,8 @@ async def start_trace(request: TraceRequest):
         },
         'checkpoint_id': None,
         'trace_state': {
-            'visited_forward': set(),
-            'visited_backward': set(),
+            'visited_forward': {},  # Dict: address -> path
+            'visited_backward': {},  # Dict: address -> path
             'visited': set(),
             'connections_found': []
         },
@@ -83,6 +87,7 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
 
         # Create wrapper linker that updates trace state for checkpointing
         checkpoint_state = sessions[session_id].get('checkpoint_state')
+        print(f"[MAIN] Creating linker with cache_manager: {cache_manager}")
         linker = BitcoinAddressLinkerWithCheckpoint(
             api,
             cache_manager,
@@ -90,6 +95,7 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
             sessions,
             checkpoint_state=checkpoint_state
         )
+        print(f"[MAIN] Linker created, cache in linker: {linker.linker.cache}")
 
         # NEW: Start periodic checkpoint task
         checkpoint_task = asyncio.create_task(
@@ -133,8 +139,8 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
             'cancelled_at': datetime.now().isoformat(),
             'progress': {
                 'addresses_examined': len(trace_state.get('visited', set())),
-                'visited_forward': len(trace_state.get('visited_forward', set())),
-                'visited_backward': len(trace_state.get('visited_backward', set())),
+                'visited_forward': len(trace_state.get('visited_forward', {})),
+                'visited_backward': len(trace_state.get('visited_backward', {})),
             }
         }
 
@@ -193,23 +199,24 @@ async def _periodic_checkpoint_task(session_id: str):
             connections_found = trace_state.get('connections_found', [])
             
             # Build checkpoint data
+            # Convert dicts to serializable format (dicts are already serializable, but ensure nested structures are handled)
             checkpoint_data = {
                 'session_id': session_id,
                 'request': sessions[session_id].get('request'),
                 'trace_state': {
-                    'visited_forward': list(trace_state.get('visited_forward', set())),  # Convert set to list
-                    'visited_backward': list(trace_state.get('visited_backward', set())),  # Convert set to list
-                    'visited': list(trace_state.get('visited', set())),  # Convert set to list
-                    'queued_forward': trace_state.get('queued_forward', []),  # ADD THIS
-                    'queued_backward': trace_state.get('queued_backward', []),  # ADD THIS
+                    'visited_forward': visited_forward,  # Dict is already serializable
+                    'visited_backward': visited_backward,  # Dict is already serializable
+                    'visited': list(visited) if isinstance(visited, set) else visited,  # Convert set to list
+                    'queued_forward': trace_state.get('queued_forward', []),
+                    'queued_backward': trace_state.get('queued_backward', []),
                     'connections_found': trace_state.get('connections_found', [])
                 },
                 'periodic_checkpoint': True,
                 'checkpoint_time': datetime.now().isoformat(),
                 'progress': {
                     'addresses_examined': len(trace_state.get('visited', set())),
-                    'visited_forward': len(trace_state.get('visited_forward', set())),
-                    'visited_backward': len(trace_state.get('visited_backward', set())),
+                    'visited_forward': len(trace_state.get('visited_forward', {})),
+                    'visited_backward': len(trace_state.get('visited_backward', {})),
                 }
             }
             
@@ -249,9 +256,35 @@ class BitcoinAddressLinkerWithCheckpoint:
             trace_state = self.checkpoint_state.copy()
             
             # Restore visited DICTIONARIES from checkpoint (not just sets)
-            visited_forward = trace_state.get('visited_forward', {})
-            visited_backward = trace_state.get('visited_backward', {})
-            visited = trace_state.get('visited', set())
+            # Handle both dict and list formats (for backward compatibility)
+            visited_forward_raw = trace_state.get('visited_forward', {})
+            visited_backward_raw = trace_state.get('visited_backward', {})
+            visited_raw = trace_state.get('visited', set())
+            
+            # Convert to proper types if needed
+            if isinstance(visited_forward_raw, list):
+                # Old format: list of addresses -> convert to dict with paths
+                visited_forward = {addr: [addr] for addr in visited_forward_raw}
+            elif isinstance(visited_forward_raw, dict):
+                visited_forward = visited_forward_raw
+            else:
+                visited_forward = {}
+            
+            if isinstance(visited_backward_raw, list):
+                # Old format: list of addresses -> convert to dict with paths
+                visited_backward = {addr: [addr] for addr in visited_backward_raw}
+            elif isinstance(visited_backward_raw, dict):
+                visited_backward = visited_backward_raw
+            else:
+                visited_backward = {}
+            
+            if isinstance(visited_raw, list):
+                visited = set(visited_raw)
+            elif isinstance(visited_raw, set):
+                visited = visited_raw
+            else:
+                visited = set()
+            
             queued_forward = trace_state.get('queued_forward', [])  # GET QUEUED
             queued_backward = trace_state.get('queued_backward', [])  # GET QUEUED
             
@@ -313,14 +346,25 @@ class BitcoinAddressLinkerWithCheckpoint:
         current = progress.get('current', '')
         direction = progress.get('direction', 'forward')
         
+        # Ensure visited_forward and visited_backward are dicts
+        if 'visited_forward' not in session['trace_state']:
+            session['trace_state']['visited_forward'] = {}
+        if 'visited_backward' not in session['trace_state']:
+            session['trace_state']['visited_backward'] = {}
+        if 'visited' not in session['trace_state']:
+            session['trace_state']['visited'] = set()
+        
+        # Convert to dict if it's a set (backward compatibility)
+        if isinstance(session['trace_state']['visited_forward'], set):
+            session['trace_state']['visited_forward'] = {addr: [addr] for addr in session['trace_state']['visited_forward']}
+        if isinstance(session['trace_state']['visited_backward'], set):
+            session['trace_state']['visited_backward'] = {addr: [addr] for addr in session['trace_state']['visited_backward']}
+        
         # Add to visited set
         session['trace_state']['visited'].add(current)
         
-        # Track direction
-        if direction == 'forward':
-            session['trace_state']['visited_forward'].add(current)
-        elif direction == 'backward':
-            session['trace_state']['visited_backward'].add(current)
+        # Track direction - graph_engine manages the dict structure, so we just ensure it exists
+        # The actual path tracking is done in graph_engine, not here
 
 
 
@@ -463,9 +507,6 @@ async def auto_resume():
     request_data = checkpoint_state.get('request', {})
     progress = checkpoint_state.get('progress', {})
     checkpoint_trace_state = checkpoint_state.get('trace_state', {})
-    visited_forward = set(checkpoint_data.get('visited_forward', []))
-    visited_backward = set(checkpoint_data.get('visited_backward', []))
-    visited = set(checkpoint_data.get('visited', []))
 
     print(f"\n[>>] Auto-resuming from session {session_id}")
     print(f" Checkpoint: {checkpoint_id}")
@@ -762,7 +803,39 @@ async def delete_session(session_id: str):
 @app.get("/cache/stats")
 async def get_cache_stats():
     """Get cache performance statistics"""
-    return cache_manager.get_cache_stats()
+    stats = cache_manager.get_cache_stats()
+    return stats
+
+@app.get("/cache/test")
+async def test_cache():
+    """Test cache functionality - store and retrieve a test entry"""
+    test_address = "test_address_12345"
+    test_txs = [{"txid": "test1", "value": 100}, {"txid": "test2", "value": 200}]
+    
+    # Try to get (should be None)
+    cached_before = cache_manager.get_cached(test_address)
+    
+    # Store
+    cache_manager.store(test_address, test_txs)
+    
+    # Try to get again (should return the data)
+    cached_after = cache_manager.get_cached(test_address)
+    
+    # Clean up test entry
+    conn = sqlite3.connect(cache_manager.db_path)
+    c = conn.cursor()
+    c.execute('DELETE FROM cached_transactions WHERE address = ?', (test_address,))
+    conn.commit()
+    conn.close()
+    
+    return {
+        "test_address": test_address,
+        "cached_before_store": cached_before is not None,
+        "cached_after_store": cached_after is not None,
+        "data_matches": cached_after == test_txs if cached_after else False,
+        "cache_working": cached_after == test_txs,
+        "stats": cache_manager.get_cache_stats()
+    }
 
 if __name__ == "__main__":
     import uvicorn
