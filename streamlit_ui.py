@@ -9,7 +9,7 @@ import time
 
 # Configuration
 API_URL = "http://localhost:8000"
-API_TIMEOUT = 20
+API_TIMEOUT = 600
 
 # Page config
 st.set_page_config(

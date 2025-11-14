@@ -169,8 +169,10 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
             'task': None  # Clear task reference
         })
 
+# CORRECTED _periodic_checkpoint_task function for main.py
+
 async def _periodic_checkpoint_task(session_id: str):
-    """NEW: Create checkpoints every 5 minutes while trace is running"""
+    """Create checkpoints every 5 minutes while trace is running"""
     CHECKPOINT_INTERVAL = 300  # 5 minutes in seconds
     
     while True:
@@ -181,25 +183,26 @@ async def _periodic_checkpoint_task(session_id: str):
             if sessions.get(session_id, {}).get('status') != 'running':
                 break
             
-            # Create checkpoint without stopping
+            # Get current trace state from session
             trace_state = sessions[session_id].get('trace_state', {})
             
-            # FIX: Handle sets properly - convert to list for serialization
+            # Extract the visited dictionaries (they should have real data now from graph_engine)
+            visited_forward = trace_state.get('visited_forward', {})
+            visited_backward = trace_state.get('visited_backward', {})
             visited = trace_state.get('visited', set())
-            visited_forward = trace_state.get('visited_forward', set())
-            visited_backward = trace_state.get('visited_backward', set())
+            connections_found = trace_state.get('connections_found', [])
             
-            # Convert sets to lists for JSON serialization
+            # Build checkpoint data
             checkpoint_data = {
                 'session_id': session_id,
                 'request': sessions[session_id].get('request'),
                 'trace_state': {
-                    'visited': list(visited) if isinstance(visited, set) else visited,
-                    'visited_forward': list(visited_forward) if isinstance(visited_forward, set) else visited_forward,
-                    'visited_backward': list(visited_backward) if isinstance(visited_backward, set) else visited_backward,
-                    'connections_found': trace_state.get('connections_found', [])
+                    'visited_forward': visited_forward,  # Dict with actual address->path data
+                    'visited_backward': visited_backward,  # Dict with actual address->path data
+                    'visited': list(visited) if isinstance(visited, set) else visited,  # Convert set to list for JSON
+                    'connections_found': connections_found
                 },
-                'periodic_checkpoint': True,  # Mark as periodic, not user-initiated
+                'periodic_checkpoint': True,
                 'checkpoint_time': datetime.now().isoformat(),
                 'progress': {
                     'addresses_examined': len(visited),
@@ -208,6 +211,7 @@ async def _periodic_checkpoint_task(session_id: str):
                 }
             }
             
+            # Save checkpoint
             checkpoint_id = checkpoint_manager.create_checkpoint(session_id, checkpoint_data)
             sessions[session_id]['last_checkpoint_time'] = datetime.now()
             
@@ -220,7 +224,6 @@ async def _periodic_checkpoint_task(session_id: str):
             print(f"[ERR] Error in periodic checkpoint: {e}")
             continue
 
-
 class BitcoinAddressLinkerWithCheckpoint:
     """Extended linker that updates session state for checkpointing AND loads from checkpoint"""
 
@@ -230,71 +233,85 @@ class BitcoinAddressLinkerWithCheckpoint:
         self.session_id = session_id
         self.sessions = sessions_dict
         
-        # FIX: Load checkpoint state if resuming
+        # Load checkpoint state if resuming
         self.checkpoint_state = checkpoint_state or {}
 
     async def find_connection(self, list_a, list_b, max_depth, start_block, end_block):
         """Find connections while updating trace state and loading from checkpoint"""
         
-        # FIX: Initialize or load trace state from checkpoint
         if self.checkpoint_state:
             # RESUMING FROM CHECKPOINT
             print(f"\n[RESUME] Resuming from checkpoint...")
             trace_state = self.checkpoint_state.copy()
             
-            # Restore visited sets from checkpoint (they're lists now, convert back)
-            visited_forward = set(trace_state.get('visited_forward', []))
-            visited_backward = set(trace_state.get('visited_backward', []))
-            visited = set(trace_state.get('visited', []))
+            # Restore visited DICTIONARIES from checkpoint (not just sets)
+            visited_forward = trace_state.get('visited_forward', {})
+            visited_backward = trace_state.get('visited_backward', {})
+            visited = trace_state.get('visited', set())
             
             print(f" Previously visited (forward): {len(visited_forward)} addresses")
             print(f" Previously visited (backward): {len(visited_backward)} addresses")
             print(f" Total visited: {len(visited)} addresses")
             print(f" Continuing trace...\n")
             
-            # Pass visited sets to linker so it skips already-visited addresses
+            # Pass visited dictionaries to linker for resumption
             result = await self.linker.find_connection_with_visited_state(
                 list_a, list_b, max_depth, start_block, end_block,
                 visited_forward=visited_forward,
-                visited_backward=visited_backward,
-                visited=visited
+                visited_backward=visited_backward
             )
         else:
-            # FRESH TRACE
-            trace_state = {
-                'visited_forward': set(),
-                'visited_backward': set(),
-                'visited': set(),
-                'queue_forward': list(list_a),
-                'queue_backward': list(list_b),
-                'connections_found': []
-            }
-            
+            # FRESH TRACE - call find_connection FIRST
             result = await self.linker.find_connection(
                 list_a, list_b, max_depth, start_block, end_block,
-                progress_callback=self._progress_callback  # ADD THIS LINE
+                progress_callback=self._progress_callback
             )
 
-        # Update session with final result
-        trace_state['connections_found'] = result.get('connections_found', [])
+        # AFTER getting result, extract visited state for checkpoint
+        trace_state = {
+            'visited_forward': result.get('visited_forward', {}),
+            'visited_backward': result.get('visited_backward', {}),
+            'visited': result.get('visited', set()),
+            'connections_found': result.get('connections_found', []),
+            'search_depth': result.get('search_depth', max_depth),
+            'status': result.get('status', 'searching')
+        }
+        
+        # Update session with full trace state
         self.sessions[self.session_id]['trace_state'] = trace_state
+        
+        # Also update progress for periodic checkpoint
+        self.sessions[self.session_id]['progress'] = {
+            'addresses_examined': result.get('total_addresses_examined', 0),
+            'visited_forward': len(trace_state.get('visited_forward', {})),
+            'visited_backward': len(trace_state.get('visited_backward', {}))
+        }
 
         return result
 
     def _progress_callback(self, progress):
+        """Callback to update trace state during search"""
         session = self.sessions.get(self.session_id)
-        if not session or not session['trace_state']:
+        if not session or 'trace_state' not in session:
             return
         
         current = progress.get('current', '')
         direction = progress.get('direction', 'forward')
         
+        # Add to visited
+        if 'visited' not in session['trace_state']:
+            session['trace_state']['visited'] = set()
         session['trace_state']['visited'].add(current)
         
+        # Add to directional visited
         if direction == 'forward':
-            session['trace_state']['visited_forward'].add(current)
+            if 'visited_forward' not in session['trace_state']:
+                session['trace_state']['visited_forward'] = {}
+            session['trace_state']['visited_forward'][current] = True
         else:
-            session['trace_state']['visited_backward'].add(current)
+            if 'visited_backward' not in session['trace_state']:
+                session['trace_state']['visited_backward'] = {}
+            session['trace_state']['visited_backward'][current] = True
 
 
 @app.get("/status/{session_id}")
@@ -728,6 +745,10 @@ async def delete_session(session_id: str):
         'message': 'Session deleted successfully'
     }
 
+@app.get("/cache/stats")
+async def get_cache_stats():
+    """Get cache performance statistics"""
+    return cache_manager.get_cache_stats()
 
 if __name__ == "__main__":
     import uvicorn

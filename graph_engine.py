@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 
 """
-CLASSIC BIDIRECTIONAL BFS WITH IMMEDIATE MEETING DETECTION
-Checks for meeting point the MOMENT a neighbor is discovered.
-If the opposite direction has already visited this address, return immediately.
-This guarantees no meeting point is missed.
+BULLETPROOF BIDIRECTIONAL BFS WITH COMPLETE DISCOVERY CHECK
+Checks discovered addresses against BOTH visited AND queued from opposite direction.
+This guarantees NO connections are missed, even if they're in the queue waiting to be explored.
 """
 
 import asyncio
@@ -119,13 +118,14 @@ class BitcoinAddressLinker:
                             end_block: Optional[int] = None,
                             progress_callback=None) -> Dict[str, Any]:
         """
-        CLASSIC BIDIRECTIONAL BFS WITH IMMEDIATE MEETING DETECTION
+        BULLETPROOF BIDIRECTIONAL BFS
         
-        Key improvement: After each neighbor discovery in EITHER direction,
-        immediately check if it was already visited by the OPPOSITE direction.
-        If so, return immediately with the combined path.
+        Key: When discovering a new neighbor, check if it exists in:
+        1. backward_visited (already explored)
+        2. backward_all_discovered (includes queued but not yet explored)
         
-        This guarantees no meeting point is missed.
+        This ensures we catch meetings even if the address is queued but hasn't
+        been explored yet by the opposite direction.
         """
         
         results = {
@@ -138,7 +138,7 @@ class BitcoinAddressLinker:
 
         print(f"\n[LINK] Linking {len(list_a)} addresses with {len(list_b)} addresses")
         print(f" Max Depth: {max_depth}, Blocks: {start_block} - {end_block}")
-        print(f" Strategy: Classic Bidirectional BFS with Immediate Meeting Detection\n")
+        print(f" Strategy: Bulletproof Bidirectional BFS (checks visited + queued)\n")
 
         # Quick check for immediate matches
         immediate_matches = set(list_a) & set(list_b)
@@ -159,19 +159,21 @@ class BitcoinAddressLinker:
             })
             results['status'] = 'connected'
             results['total_addresses_examined'] = 2
+            results['visited_forward'] = forward_discovered
+            results['visited_backward'] = backward_discovered
             return results
 
-        # Initialize separate queues for forward and backward
-        forward_queue = deque([(addr, [addr]) for addr in list_a])  # (address, path)
-        backward_queue = deque([(addr, [addr]) for addr in list_b])  # (address, path)
+        # Initialize separate queues and visited dictionaries
+        forward_queue = deque([(addr, [addr]) for addr in list_a])
+        backward_queue = deque([(addr, [addr]) for addr in list_b])
 
-        # Visited sets and path tracking
-        forward_visited = {addr: [addr] for addr in list_a}  # address -> path to it
-        backward_visited = {addr: [addr] for addr in list_b}  # address -> path to it
+        # Store both visited addresses and paths
+        forward_discovered = {addr: [addr] for addr in list_a}
+        forward_visited = set()  # START EMPTY! ← FIX
 
-        # Target sets
-        list_a_set = set(list_a)
-        list_b_set = set(list_b)
+        # Same for backward
+        backward_discovered = {addr: [addr] for addr in list_b}
+        backward_visited = set()  # START EMPTY! ← FIX
 
         # ALTERNATING BFS: One step forward, one step backward, repeat
         for current_depth in range(max_depth):
@@ -180,7 +182,7 @@ class BitcoinAddressLinker:
             print(f"{'='*70}")
 
             # ===== FORWARD STEP =====
-            print(f"\n[>>] Forward BFS (queue size: {len(forward_queue)}):")
+            print(f"\n[>>] Forward BFS (queue: {len(forward_queue)}):")
             
             forward_queue_size = len(forward_queue)
             addresses_explored_this_level = 0
@@ -191,6 +193,11 @@ class BitcoinAddressLinker:
 
                 current, path = forward_queue.popleft()
 
+                # Skip if somehow already visited (shouldn't happen in normal operation)
+                if current in forward_visited:
+                    continue
+
+                forward_visited.add(current)
                 print(f"  Exploring: {current}")
 
                 try:
@@ -204,20 +211,20 @@ class BitcoinAddressLinker:
                         neighbors = outputs | inputs
 
                         for neighbor in neighbors:
-                            # Skip if already visited in forward
-                            if neighbor in forward_visited:
+                            # Skip if already discovered in forward direction
+                            if neighbor in forward_discovered:
                                 continue
 
                             new_path = path + [neighbor]
 
-                            # *** CRITICAL: CHECK IF OPPOSITE DIRECTION VISITED THIS ***
-                            if neighbor in backward_visited:
+                            # *** CRITICAL: CHECK AGAINST ALL DISCOVERED FROM OPPOSITE DIRECTION ***
+                            if neighbor in backward_discovered:
                                 # MEETING POINT FOUND!
-                                backward_path = backward_visited[neighbor]
-                                # Combine: forward_path + reversed(backward_path[1:])
+                                backward_path = backward_discovered[neighbor]
                                 full_path = new_path + list(reversed(backward_path[1:]))
                                 
                                 print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
+                                print(f"    (In backward {'visited' if neighbor in backward_visited else 'queue'})")
                                 print(f" Path: {' -> '.join(full_path)}")
                                 
                                 results['connections_found'].append({
@@ -234,10 +241,14 @@ class BitcoinAddressLinker:
                                 results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
 
                                 print(f" Total addresses examined: {results['total_addresses_examined']}")
+                                
+                                results['visited_forward'] = forward_discovered
+                                results['visited_backward'] = backward_discovered   
+                                
                                 return results
 
-                            # Add to visited and queue
-                            forward_visited[neighbor] = new_path
+                            # Add to discovered and queue
+                            forward_discovered[neighbor] = new_path
                             forward_queue.append((neighbor, new_path))
                             neighbor_count += 1
 
@@ -250,7 +261,7 @@ class BitcoinAddressLinker:
             print(f"  Forward explored {addresses_explored_this_level} addresses, queue now: {len(forward_queue)}")
 
             # ===== BACKWARD STEP =====
-            print(f"\n[<<] Backward BFS (queue size: {len(backward_queue)}):")
+            print(f"\n[<<] Backward BFS (queue: {len(backward_queue)}):")
             
             backward_queue_size = len(backward_queue)
             addresses_explored_this_level = 0
@@ -261,6 +272,11 @@ class BitcoinAddressLinker:
 
                 current, path = backward_queue.popleft()
 
+                # Skip if somehow already visited
+                if current in backward_visited:
+                    continue
+
+                backward_visited.add(current)
                 print(f"  Exploring: {current}")
 
                 try:
@@ -274,20 +290,20 @@ class BitcoinAddressLinker:
                         neighbors = inputs | outputs
 
                         for neighbor in neighbors:
-                            # Skip if already visited in backward
-                            if neighbor in backward_visited:
+                            # Skip if already discovered in backward direction
+                            if neighbor in backward_discovered:
                                 continue
 
                             new_path = path + [neighbor]
 
-                            # *** CRITICAL: CHECK IF OPPOSITE DIRECTION VISITED THIS ***
-                            if neighbor in forward_visited:
+                            # *** CRITICAL: CHECK AGAINST ALL DISCOVERED FROM OPPOSITE DIRECTION ***
+                            if neighbor in forward_discovered:
                                 # MEETING POINT FOUND!
-                                forward_path = forward_visited[neighbor]
-                                # Combine: forward_path + reversed(backward_path[1:])
+                                forward_path = forward_discovered[neighbor]
                                 full_path = forward_path + list(reversed(new_path[1:]))
                                 
                                 print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
+                                print(f"    (In forward {'visited' if neighbor in forward_visited else 'queue'})")
                                 print(f" Path: {' -> '.join(full_path)}")
                                 
                                 results['connections_found'].append({
@@ -304,10 +320,14 @@ class BitcoinAddressLinker:
                                 results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
 
                                 print(f" Total addresses examined: {results['total_addresses_examined']}")
+
+                                results['visited_forward'] = forward_discovered
+                                results['visited_backward'] = backward_discovered
+    
                                 return results
 
-                            # Add to visited and queue
-                            backward_visited[neighbor] = new_path
+                            # Add to discovered and queue
+                            backward_discovered[neighbor] = new_path
                             backward_queue.append((neighbor, new_path))
                             neighbor_count += 1
 
@@ -321,8 +341,8 @@ class BitcoinAddressLinker:
 
             # Status
             print(f"\n[STATUS] Depth {current_depth} complete:")
-            print(f" Forward visited: {len(forward_visited)}, queue: {len(forward_queue)}")
-            print(f" Backward visited: {len(backward_visited)}, queue: {len(backward_queue)}")
+            print(f" Forward   visited: {len(forward_visited)}, discovered: {len(forward_discovered)}, queue: {len(forward_queue)}")
+            print(f" Backward  visited: {len(backward_visited)}, discovered: {len(backward_discovered)}, queue: {len(backward_queue)}")
 
             # If both queues empty, stop
             if not forward_queue and not backward_queue:
@@ -335,7 +355,10 @@ class BitcoinAddressLinker:
 
         print(f"\n[âœ—] No connection found within {max_depth} depth levels")
         print(f" Total addresses examined: {results['total_addresses_examined']}")
-
+        
+        results['visited_forward'] = forward_discovered
+        results['visited_backward'] = backward_discovered
+        
         return results
 
     async def find_connection_with_visited_state(self, list_a: List[str], list_b: List[str],
@@ -345,7 +368,7 @@ class BitcoinAddressLinker:
                                                 visited_forward: Dict[str, List[str]] = None,
                                                 visited_backward: Dict[str, List[str]] = None,
                                                 progress_callback=None) -> Dict[str, Any]:
-        """Find connections with checkpoint state, using classic bidirectional BFS."""
+        """Find connections with checkpoint state, checking visited + queued."""
 
         if visited_forward is None:
             visited_forward = {addr: [addr] for addr in list_a}
@@ -362,7 +385,7 @@ class BitcoinAddressLinker:
 
         print(f"\n[LINK] Linking {len(list_a)} addresses with {len(list_b)} addresses")
         print(f" Max Depth: {max_depth}")
-        print(f" Resuming with {len(visited_forward)} + {len(visited_backward)} visited\n")
+        print(f" Resuming with {len(visited_forward)} + {len(visited_backward)} discovered\n")
 
         # Quick check for immediate matches
         immediate_matches = set(list_a) & set(list_b)
@@ -382,19 +405,24 @@ class BitcoinAddressLinker:
             })
             results['status'] = 'connected'
             results['total_addresses_examined'] = 2
+            results['visited_forward'] = forward_discovered
+            results['visited_backward'] = backward_discovered
             return results
 
-        # Build initial queues from unvisited addresses
+        # Build initial queues from discovered addresses
         forward_queue = deque()
         for addr, path in visited_forward.items():
             forward_queue.append((addr, path))
+        
+        forward_discovered = dict(visited_forward)  # Copy
+        forward_visited = set(visited_forward.keys())
 
         backward_queue = deque()
         for addr, path in visited_backward.items():
             backward_queue.append((addr, path))
-
-        list_a_set = set(list_a)
-        list_b_set = set(list_b)
+        
+        backward_discovered = dict(visited_backward)  # Copy
+        backward_visited = set(visited_backward.keys())
 
         # ALTERNATING BFS
         for current_depth in range(max_depth):
@@ -413,6 +441,10 @@ class BitcoinAddressLinker:
 
                 current, path = forward_queue.popleft()
 
+                if current in forward_visited:
+                    continue
+
+                forward_visited.add(current)
                 print(f"  Exploring: {current}")
 
                 try:
@@ -426,16 +458,17 @@ class BitcoinAddressLinker:
                         neighbors = outputs | inputs
 
                         for neighbor in neighbors:
-                            if neighbor in visited_forward:
+                            if neighbor in forward_discovered:
                                 continue
 
                             new_path = path + [neighbor]
 
-                            if neighbor in visited_backward:
-                                backward_path = visited_backward[neighbor]
+                            if neighbor in backward_discovered:
+                                backward_path = backward_discovered[neighbor]
                                 full_path = new_path + list(reversed(backward_path[1:]))
                                 
                                 print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
+                                print(f"    (In backward {'visited' if neighbor in backward_visited else 'queue'})")
                                 print(f" Path: {' -> '.join(full_path)}")
                                 
                                 results['connections_found'].append({
@@ -449,11 +482,13 @@ class BitcoinAddressLinker:
                                     'direction': 'forward_meets_backward'
                                 })
                                 results['status'] = 'connected'
-                                results['total_addresses_examined'] = len(visited_forward) + len(visited_backward)
+                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
                                 print(f" Total addresses examined: {results['total_addresses_examined']}")
+                                results['visited_forward'] = forward_discovered
+                                results['visited_backward'] = backward_discovered
                                 return results
 
-                            visited_forward[neighbor] = new_path
+                            forward_discovered[neighbor] = new_path
                             forward_queue.append((neighbor, new_path))
                             neighbor_count += 1
 
@@ -476,6 +511,10 @@ class BitcoinAddressLinker:
 
                 current, path = backward_queue.popleft()
 
+                if current in backward_visited:
+                    continue
+
+                backward_visited.add(current)
                 print(f"  Exploring: {current}")
 
                 try:
@@ -489,16 +528,17 @@ class BitcoinAddressLinker:
                         neighbors = inputs | outputs
 
                         for neighbor in neighbors:
-                            if neighbor in visited_backward:
+                            if neighbor in backward_discovered:
                                 continue
 
                             new_path = path + [neighbor]
 
-                            if neighbor in visited_forward:
-                                forward_path = visited_forward[neighbor]
+                            if neighbor in forward_discovered:
+                                forward_path = forward_discovered[neighbor]
                                 full_path = forward_path + list(reversed(new_path[1:]))
                                 
                                 print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
+                                print(f"    (In forward {'visited' if neighbor in forward_visited else 'queue'})")
                                 print(f" Path: {' -> '.join(full_path)}")
                                 
                                 results['connections_found'].append({
@@ -512,11 +552,13 @@ class BitcoinAddressLinker:
                                     'direction': 'backward_meets_forward'
                                 })
                                 results['status'] = 'connected'
-                                results['total_addresses_examined'] = len(visited_forward) + len(visited_backward)
+                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
                                 print(f" Total addresses examined: {results['total_addresses_examined']}")
+                                results['visited_forward'] = forward_discovered
+                                results['visited_backward'] = backward_discovered
                                 return results
 
-                            visited_backward[neighbor] = new_path
+                            backward_discovered[neighbor] = new_path
                             backward_queue.append((neighbor, new_path))
                             neighbor_count += 1
 
@@ -529,17 +571,19 @@ class BitcoinAddressLinker:
             print(f"  Backward explored {addresses_explored}, queue now: {len(backward_queue)}")
 
             print(f"\n[STATUS] Depth {current_depth} complete:")
-            print(f" Forward visited: {len(visited_forward)}, queue: {len(forward_queue)}")
-            print(f" Backward visited: {len(visited_backward)}, queue: {len(backward_queue)}")
+            print(f" Forward   visited: {len(forward_visited)}, discovered: {len(forward_discovered)}, queue: {len(forward_queue)}")
+            print(f" Backward  visited: {len(backward_visited)}, discovered: {len(backward_discovered)}, queue: {len(backward_queue)}")
 
             if not forward_queue and not backward_queue:
                 print(f"\n[!] Both queues exhausted")
                 break
 
         results['status'] = 'no_connection'
-        results['total_addresses_examined'] = len(visited_forward) + len(visited_backward)
+        results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
 
         print(f"\n[âœ—] No connection found")
+        results['visited_forward'] = forward_discovered
+        results['visited_backward'] = backward_discovered
         return results
 
     # Legacy methods for backward compatibility
