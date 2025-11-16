@@ -22,12 +22,12 @@ class APIProvider(Enum):
     BLOCKCHAIN = "blockchain"
 
 # Configuration
-DEFAULT_API = "mempool"  # Start with Mempool (public, no auth)
+DEFAULT_API = "electrs"  # Start with Mempool (public, no auth)
 
 BLOCKCHAIR_API_URL = "https://api.blockchair.com/bitcoin"
 BLOCKCHAIN_API_URL = "https://blockchain.info"
 MEMPOOL_API_URL = "https://mempool.space/api"
-ELECTRS_LOCAL_URL = "http://localhost:50002"
+ELECTRS_LOCAL_URL = "http://100.94.34.56:50001"
 
 
 MIXER_INPUT_THRESHOLD = 30          # Min inputs to be considered "mixer-like"  100-100-50

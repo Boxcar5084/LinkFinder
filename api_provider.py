@@ -4,6 +4,9 @@ import asyncio
 from typing import List, Dict, Optional, Any
 from abc import ABC, abstractmethod
 from config import DEFAULT_API
+import socket
+import json
+
 
 class APIProvider(ABC):
     """Base class for blockchain data providers"""
@@ -238,88 +241,116 @@ class MempoolProvider(APIProvider):
         """Cleanup"""
         pass
 
-
 class ElectrsProvider(APIProvider):
-    """Local Electrs node provider"""
-
-    def __init__(self, host: str = "localhost", port: int = 50002):
-        self.base_url = f"http://{host}:{port}"
+    """Local Electrs node provider using Electrum protocol (JSON-RPC over TCP)"""
+    
+    def __init__(self, host: str = "100.94.34.56", port: int = 50001, use_ssl: bool = False):
+        self.host = host
+        self.port = port
+        self.use_ssl = use_ssl
         self.timeout = 30
-
+        self.request_id = 0
+    
+    async def _send_request(self, method: str, params: list) -> Dict[str, Any]:
+        """Send a JSON-RPC request to Electrs over TCP"""
+        self.request_id += 1
+        
+        request = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": self.request_id
+        }
+        
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            
+            print(f"[ELECTRS] Connecting to {self.host}:{self.port}...")
+            sock.connect((self.host, self.port))
+            
+            # Send JSON-RPC request
+            message = json.dumps(request) + "\n"
+            sock.sendall(message.encode())
+            
+            # Receive response
+            response_data = b""
+            while True:
+                try:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    response_data += chunk
+                except socket.timeout:
+                    break
+            
+            sock.close()
+            
+            # Parse response
+            response_text = response_data.decode().strip()
+            if not response_text:
+                print("[ELECTRS] Empty response from server")
+                return {}
+            
+            response = json.loads(response_text)
+            
+            if "error" in response and response["error"]:
+                print(f"[ELECTRS] RPC error: {response['error']}")
+                return {}
+            
+            return response.get("result", {})
+        
+        except socket.timeout:
+            print("[ELECTRS] Socket timeout")
+            return {}
+        except ConnectionRefusedError:
+            print(f"[ELECTRS] Connection refused to {self.host}:{self.port}")
+            return {}
+        except Exception as e:
+            print(f"[ELECTRS] Socket error: {str(e)[:100]}")
+            return {}
+    
     async def get_address_transactions(self, address: str,
-                                     start_block: Optional[int] = None,
-                                     end_block: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Fetch transactions from local Electrs node"""
-        url = f"{self.base_url}/address/{address}/txs"
-
-        # Add retry logic for Electrs as well
-        max_retries = 3
-        retry_delay = 1  # Local node, shorter delays
-
-        for attempt in range(max_retries):
-            try:
-                await asyncio.sleep(0.1)  # Minimal delay for local
-
-                response = requests.get(url, timeout=self.timeout)
-                response.raise_for_status()
-
-                txs = response.json()
-
-                if not isinstance(txs, list):
-                    return []
-
-                # Filter by block range
-                if start_block or end_block:
-                    filtered_txs = []
-                    for tx in txs:
-                        block_height = tx.get('block_height')
-
-                        if block_height is None or block_height == 0:
-                            continue
-
-                        if start_block and block_height < start_block:
-                            continue
-
-                        if end_block and block_height > end_block:
-                            continue
-
-                        filtered_txs.append(tx)
-
-                    txs = filtered_txs
-
-                print(f" [OK] Found {len(txs)} transactions")
-                return txs
-
-            except requests.exceptions.Timeout:
-                # Retry on timeout
-                print(f" [WAIT] Timeout. Attempt {attempt + 1}/{max_retries}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                continue
-
-            except requests.exceptions.ConnectionError as e:
-                # Retry on connection errors
-                print(f" [WAIT] Connection error. Attempt {attempt + 1}/{max_retries}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay * 2)  # Longer wait for connection issues
+                                      start_block: Optional[int] = None,
+                                      end_block: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Fetch transactions from Electrs using Electrum protocol"""
+        
+        try:
+            # Request address history using Electrum protocol
+            history = await self._send_request("blockchain.address.get_history", [address])
+            
+            if not history or not isinstance(history, list):
+                print(f"[ELECTRS] No transactions found for {address}")
+                return []
+            
+            print(f"[ELECTRS] Found {len(history)} transaction entries")
+            
+            # Convert history entries to transaction objects
+            transactions = []
+            for entry in history:
+                tx_hash = entry.get("tx_hash")
+                height = entry.get("height", 0)
+                
+                # Filter by block range if specified
+                if start_block and height > 0 and height < start_block:
                     continue
-                print(f" [ERR] Electrs error: {str(e)[:100]}")
-                return []
-
-            except requests.exceptions.RequestException as e:
-                print(f" [ERR] Electrs request error: {str(e)[:100]}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
+                if end_block and height > 0 and height > end_block:
                     continue
-                return []
-
-            except Exception as e:
-                print(f" [ERR] Electrs error: {str(e)[:100]}")
-                return []
-
-        print(f" [ERR] Max retries exceeded for {address} on Electrs")
-        return []
-
+                
+                transactions.append({
+                    "hash": tx_hash,
+                    "block_height": height if height > 0 else None,
+                    "tx_hash": tx_hash,
+                    "height": height
+                })
+            
+            print(f"[ELECTRS] Filtered to {len(transactions)} transactions")
+            return transactions
+        
+        except Exception as e:
+            print(f"[ELECTRS] Error fetching transactions: {str(e)[:100]}")
+            return []
+    
     async def close(self):
         """Cleanup"""
         pass
@@ -350,7 +381,8 @@ def get_provider(provider_name: str = None) -> APIProvider:
 
     elif provider_name == "electrs":
         print("[API] Using Local Electrs Node")
-        return ElectrsProvider()
+        return ElectrsProvider(host="100.94.34.56", port=50001, use_ssl=False)
+
 
     else:
         raise ValueError(f"Unknown provider: {provider_name}. Use 'blockchain', 'mempool', or 'electrs'")
