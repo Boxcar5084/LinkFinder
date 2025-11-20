@@ -15,7 +15,7 @@ def get_electrs_height():
     
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5)
+        sock.settimeout(15)
         sock.connect((host, port))
         
         request = {
