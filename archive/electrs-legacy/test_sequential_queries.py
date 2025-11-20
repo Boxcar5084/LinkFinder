@@ -9,7 +9,7 @@ import time
 
 def test_sequential_queries():
     """Test multiple sequential queries to reproduce the issue"""
-    host = "192.168.7.218"
+    host = "100.94.34.56"
     port = 50001
     
     print("\n" + "="*60)

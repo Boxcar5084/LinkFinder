@@ -12,7 +12,7 @@
   - **Methods used**:
     - `blockchain.scripthash.get_history` - Get transaction history
     - `blockchain.transaction.get` - Get full transaction details
-  - **Connection**: Direct TCP socket connection to `192.168.7.218:50001`
+  - **Connection**: Direct TCP socket connection to `100.94.34.56:50001`
   - **Helper methods**:
     - `_address_to_scripthash()` - Converts Bitcoin address to Electrum scripthash
     - `_send_request()` - Sends JSON-RPC requests over TCP
@@ -20,21 +20,21 @@
 
 #### Configuration
 - **File**: `config.py`
-  - `ELECTRS_HOST = "192.168.7.218"` (line 31)
+  - `ELECTRS_HOST = "100.94.34.56"` (line 31)
   - `ELECTRS_PORT = 50001` (line 32)
-  - `ELECTRS_LOCAL_URL = "tcp://192.168.7.218:50001"` (line 30)
+  - `ELECTRS_LOCAL_URL = "tcp://100.94.34.56:50001"` (line 30)
   - `DEFAULT_API = "electrs"` (line 25)
   - `APIProvider.ELECTRS = "electrs"` enum value (line 21)
 
 #### Factory Function
 - **File**: `api_provider.py` (lines 663-692)
-  - `get_provider("electrs")` returns `ElectrsProvider(host="192.168.7.218", port=50001, use_ssl=False)`
+  - `get_provider("electrs")` returns `ElectrsProvider(host="100.94.34.56", port=50001, use_ssl=False)`
   - Hardcoded host/port values
 
 ### Infrastructure References
 
 #### Docker/Container References
-- **No docker-compose.yml in repo** (user mentioned it's on Windows host at `192.168.7.218`)
+- **No docker-compose.yml in repo** (user mentioned it's on Windows host at `100.94.34.56`)
 - **Diagnostic scripts reference**:
   - `docker exec electrs` commands
   - `getumbrel/electrs:v0.10.10` image
@@ -105,14 +105,14 @@ Since the codebase **already uses Electrum protocol**, migration is straightforw
 **Changes:**
 ```python
 # OLD
-ELECTRS_HOST = "192.168.7.218"
+ELECTRS_HOST = "100.94.34.56"
 ELECTRS_PORT = 50001
-ELECTRS_LOCAL_URL = "tcp://192.168.7.218:50001"
+ELECTRS_LOCAL_URL = "tcp://100.94.34.56:50001"
 DEFAULT_API = "electrs"
 APIProvider.ELECTRS = "electrs"
 
 # NEW
-ELECTRUMX_HOST = os.getenv("ELECTRUMX_HOST", "192.168.7.218")
+ELECTRUMX_HOST = os.getenv("ELECTRUMX_HOST", "100.94.34.56")
 ELECTRUMX_PORT = int(os.getenv("ELECTRUMX_PORT", "50001"))
 ELECTRUMX_USE_SSL = os.getenv("ELECTRUMX_USE_SSL", "false").lower() == "true"
 DEFAULT_API = "electrumx"
@@ -150,7 +150,7 @@ APIProvider.ELECTRUMX = "electrumx"
 # OLD
 elif provider_name == "electrs":
     print("[API] Using Local Electrs Node")
-    return ElectrsProvider(host="192.168.7.218", port=50001, use_ssl=False)
+    return ElectrsProvider(host="100.94.34.56", port=50001, use_ssl=False)
 
 # NEW
 elif provider_name == "electrumx":
@@ -208,14 +208,14 @@ DEFAULT_API = "electrumx"  # Changed from "electrs"
 
 **Add to `.env` file (or use system env):**
 ```bash
-ELECTRUMX_HOST=192.168.7.218
+ELECTRUMX_HOST=100.94.34.56
 ELECTRUMX_PORT=50001
 ELECTRUMX_USE_SSL=false
 ```
 
 **For SSL connections:**
 ```bash
-ELECTRUMX_HOST=192.168.7.218
+ELECTRUMX_HOST=100.94.34.56
 ELECTRUMX_PORT=50002
 ELECTRUMX_USE_SSL=true
 ```

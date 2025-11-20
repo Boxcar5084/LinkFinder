@@ -7,7 +7,7 @@ def test_electrs_with_protection():
     """
     Test electrs with proper error handling and protection against hanging
     """
-    host = "192.168.7.218"
+    host = "100.94.34.56"
     port = 50001
     
     print("\n" + "="*60)
@@ -392,7 +392,7 @@ def test_electrs_with_protection():
     print("- If TEST 1-2 work but TEST 4 fails: specific scripthash causing hang")
     print("- If TEST 6 times out: electrs may be slow or still syncing/indexing")
     print("\nRECOMMENDATIONS:")
-    print("1. Check electrs logs on the server (192.168.7.218)")
+    print("1. Check electrs logs on the server (100.94.34.56)")
     print("2. Verify Bitcoin Core is fully synced and running")
     print("3. Check electrs database/index status")
     print("4. Consider restarting electrs if queries consistently timeout")

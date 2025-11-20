@@ -44,7 +44,7 @@ Complete guide for configuring electrs in Docker.
 
 ### Step 1: Create/Update electrs.toml
 
-On your server (192.168.7.218), create or update the electrs configuration:
+On your server (100.94.34.56), create or update the electrs configuration:
 
 ```bash
 # Find where electrs data is stored (usually in Docker volume)

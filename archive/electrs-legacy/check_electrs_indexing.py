@@ -8,7 +8,7 @@ import time
 
 def check_electrs_indexing_status():
     """Check if electrs has finished indexing"""
-    host = "192.168.7.218"
+    host = "100.94.34.56"
     port = 50001
     
     print("\n" + "="*60)
@@ -121,7 +121,7 @@ def check_electrs_indexing_status():
 
 def main():
     """Main function to check indexing status"""
-    host = "192.168.7.218"
+    host = "100.94.34.56"
     port = 50001
     
     print("\n" + "="*60)

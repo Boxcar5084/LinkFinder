@@ -2,7 +2,7 @@
 import socket
 import json
 
-host = "192.168.7.218"   #"100.94.34.56"
+host = "100.94.34.56"   #"100.94.34.56"
 port = 50001
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

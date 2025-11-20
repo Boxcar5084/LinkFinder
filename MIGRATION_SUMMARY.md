@@ -39,7 +39,7 @@ Successfully migrated from electrs to ElectrumX backend. The codebase now uses E
 
 ### Environment Variables
 
-- **`ELECTRUMX_HOST`** (default: `192.168.7.218`)
+- **`ELECTRUMX_HOST`** (default: `100.94.34.56`)
   - ElectrumX server hostname or IP address
 
 - **`ELECTRUMX_PORT`** (default: `50001`)
@@ -104,7 +104,7 @@ All electrs-specific files have been moved to `archive/electrs-legacy/`:
 Create a `.env` file (or export environment variables):
 
 ```bash
-ELECTRUMX_HOST=192.168.7.218
+ELECTRUMX_HOST=100.94.34.56
 ELECTRUMX_PORT=50001
 ELECTRUMX_USE_SSL=false
 DEFAULT_API=electrumx
@@ -115,7 +115,7 @@ DEFAULT_API=electrumx
 If using SSL (port 50002):
 
 ```bash
-ELECTRUMX_HOST=192.168.7.218
+ELECTRUMX_HOST=100.94.34.56
 ELECTRUMX_PORT=50002
 ELECTRUMX_USE_SSL=true
 ELECTRUMX_CERT=/path/to/cert.pem  # Optional

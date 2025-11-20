@@ -35,8 +35,8 @@ services:
     image: getumbrel/electrs:v0.10.10
     container_name: electrs
     environment:
-      - ELECTRS_DAEMON_RPC_ADDR=192.168.7.218:8332
-      - ELECTRS_DAEMON_P2P_ADDR=192.168.7.218:8333
+      - ELECTRS_DAEMON_RPC_ADDR=100.94.34.56:8332
+      - ELECTRS_DAEMON_P2P_ADDR=100.94.34.56:8333
       - ELECTRS_ELECTRUM_RPC_ADDR=0.0.0.0:50001
       - ELECTRS_DB_DIR=/data  # Changed from /data/bitcoin
       - ELECTRS_DB_PARALLELISM=4

@@ -10,7 +10,7 @@ from datetime import datetime
 
 def get_electrs_height():
     """Get current electrs block height"""
-    host = "192.168.7.218"
+    host = "100.94.34.56"
     port = 50001
     
     try:

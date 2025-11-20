@@ -124,7 +124,7 @@ def main():
     print("ELECTRS DOCKER CONFIGURATION CHECKER")
     print("="*60)
     
-    host = "192.168.7.218"
+    host = "100.94.34.56"
     port = 50001
     
     container_running = check_docker_container()

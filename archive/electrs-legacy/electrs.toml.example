@@ -11,7 +11,7 @@ daemon_rpc_addr = "host.docker.internal:8332"
 # OR if using Docker host network mode:
 # daemon_rpc_addr = "127.0.0.1:8332"
 # OR if Bitcoin Core is on another machine:
-# daemon_rpc_addr = "192.168.7.218:8332"
+# daemon_rpc_addr = "100.94.34.56:8332"
 
 # Bitcoin Core RPC credentials (if needed)
 # daemon_auth = "username:password"

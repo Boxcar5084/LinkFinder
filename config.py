@@ -31,14 +31,14 @@ BLOCKCHAIN_API_URL = "https://blockchain.info"
 MEMPOOL_API_URL = "https://mempool.space/api"
 
 # ElectrumX Configuration (Electrum protocol over TCP/SSL)
-ELECTRUMX_HOST = os.getenv("ELECTRUMX_HOST", "192.168.7.218")
+ELECTRUMX_HOST = os.getenv("ELECTRUMX_HOST", "100.94.34.56")
 ELECTRUMX_PORT = int(os.getenv("ELECTRUMX_PORT", "50001"))
 ELECTRUMX_USE_SSL = os.getenv("ELECTRUMX_USE_SSL", "false").lower() == "true"
 ELECTRUMX_CERT = os.getenv("ELECTRUMX_CERT", None)  # Optional: path to SSL certificate
 
 # Legacy electrs config (deprecated - will be removed)
-ELECTRS_LOCAL_URL = "tcp://192.168.7.218:50001"  # Deprecated
-ELECTRS_HOST = "192.168.7.218"  # Deprecated
+ELECTRS_LOCAL_URL = "tcp://100.94.34.56:50001"  # Deprecated
+ELECTRS_HOST = "100.94.34.56"  # Deprecated
 ELECTRS_PORT = 50001  # Deprecated
 
 
