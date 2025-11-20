@@ -27,7 +27,9 @@ DEFAULT_API = "electrs"  # Start with Mempool (public, no auth)
 BLOCKCHAIR_API_URL = "https://api.blockchair.com/bitcoin"
 BLOCKCHAIN_API_URL = "https://blockchain.info"
 MEMPOOL_API_URL = "https://mempool.space/api"
-ELECTRS_LOCAL_URL = "http://100.94.34.56:50001"
+ELECTRS_LOCAL_URL = "tcp://192.168.7.218:50001"  # TCP socket connection, not HTTP
+ELECTRS_HOST = "192.168.7.218"
+ELECTRS_PORT = 50001
 
 
 MIXER_INPUT_THRESHOLD = 30          # Min inputs to be considered "mixer-like"  100-100-50

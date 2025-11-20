@@ -1,0 +1,44 @@
+# Electrs Configuration Template
+# Copy this to your electrs data directory and modify as needed
+# Location: Usually in /path/to/electrs-data/electrs.toml
+
+# Network configuration
+network = "mainnet"  # Options: "mainnet", "testnet", "signet", "regtest"
+
+# Bitcoin Core RPC connection
+# For Docker accessing host Bitcoin Core:
+daemon_rpc_addr = "host.docker.internal:8332"
+# OR if using Docker host network mode:
+# daemon_rpc_addr = "127.0.0.1:8332"
+# OR if Bitcoin Core is on another machine:
+# daemon_rpc_addr = "192.168.7.218:8332"
+
+# Bitcoin Core RPC credentials (if needed)
+# daemon_auth = "username:password"
+
+# Electrum RPC server configuration
+# CRITICAL: Use 0.0.0.0 to allow connections from outside container
+electrum_rpc_addr = "0.0.0.0:50001"
+
+# Connection limits (IMPORTANT for fixing "first query works" issue)
+max_connections = 100  # Increase from default (often 50)
+max_subscriptions = 100
+
+# Timeouts
+daemon_timeout = 30
+daemon_poll_interval = 10
+
+# Indexing configuration
+index_batch_size = 10000
+index_lookup_limit = 100000
+
+# Database configuration
+db_dir = "/data"  # Path inside container
+
+# Logging
+log_filters = "INFO"  # Options: "DEBUG", "INFO", "WARN", "ERROR"
+
+# Optional: Performance tuning
+# cache_size = 104857600  # 100MB cache
+# bulk_index_threads = 4
+

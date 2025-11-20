@@ -1,11 +1,21 @@
 # -*- coding: utf-8 -*-
 import requests
 import asyncio
+import time
+import hashlib
 from typing import List, Dict, Optional, Any
 from abc import ABC, abstractmethod
 from config import DEFAULT_API
 import socket
 import json
+
+# For address to scripthash conversion
+try:
+    import base58
+    HAS_BASE58 = True
+except ImportError:
+    HAS_BASE58 = False
+    print("[ELECTRS] Warning: base58 library not installed. Install with: pip install base58")
 
 
 class APIProvider(ABC):
@@ -244,15 +254,55 @@ class MempoolProvider(APIProvider):
 class ElectrsProvider(APIProvider):
     """Local Electrs node provider using Electrum protocol (JSON-RPC over TCP)"""
     
-    def __init__(self, host: str = "100.94.34.56", port: int = 50001, use_ssl: bool = False):
+    def __init__(self, host: str = "192.168.7.218", port: int = 50001, use_ssl: bool = False):
         self.host = host
         self.port = port
         self.use_ssl = use_ssl
         self.timeout = 30
         self.request_id = 0
+        self._connection_pool = None  # For future connection pooling
     
-    async def _send_request(self, method: str, params: list) -> Dict[str, Any]:
-        """Send a JSON-RPC request to Electrs over TCP"""
+    def _address_to_scripthash(self, address: str) -> Optional[str]:
+        """
+        Convert Bitcoin address to Electrum scripthash.
+        Scripthash = SHA256(script) reversed, hex-encoded
+        
+        For P2PKH addresses (starting with 1):
+        - Decode base58 to get hash160
+        - Create script: OP_DUP OP_HASH160 <hash160> OP_EQUALVERIFY OP_CHECKSIG
+        - SHA256 the script, reverse bytes, hex encode
+        """
+        if not HAS_BASE58:
+            return None
+            
+        try:
+            # Decode base58 address
+            decoded = base58.b58decode(address)
+            
+            # Extract the hash160 (20 bytes) from decoded address
+            # Address format: version (1 byte) + hash160 (20 bytes) + checksum (4 bytes)
+            if len(decoded) >= 21:
+                hash160 = decoded[1:21]  # Skip version byte, take 20 bytes
+                
+                # Create script: OP_DUP OP_HASH160 <hash160> OP_EQUALVERIFY OP_CHECKSIG
+                # For P2PKH: 76a914<hash160>88ac
+                script_bytes = bytes([0x76, 0xa9, 0x14]) + hash160 + bytes([0x88, 0xac])
+                
+                # SHA256 of script
+                sha256_hash = hashlib.sha256(script_bytes).digest()
+                
+                # Reverse bytes and hex encode (Electrum format)
+                scripthash = sha256_hash[::-1].hex()
+                
+                return scripthash
+            else:
+                return None
+        except Exception as e:
+            print(f"[ELECTRS] Error converting address to scripthash: {e}")
+            return None
+    
+    async def _send_request(self, method: str, params: list, timeout: Optional[int] = None, max_retries: int = 3) -> Dict[str, Any]:
+        """Send a JSON-RPC request to Electrs over TCP with improved response handling and retry logic"""
         self.request_id += 1
         
         request = {
@@ -262,62 +312,276 @@ class ElectrsProvider(APIProvider):
             "id": self.request_id
         }
         
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.timeout)
-            
-            print(f"[ELECTRS] Connecting to {self.host}:{self.port}...")
-            sock.connect((self.host, self.port))
-            
-            # Send JSON-RPC request
-            message = json.dumps(request) + "\n"
-            sock.sendall(message.encode())
-            
-            # Receive response
-            response_data = b""
-            while True:
-                try:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    response_data += chunk
-                except socket.timeout:
-                    break
-            
-            sock.close()
-            
-            # Parse response
-            response_text = response_data.decode().strip()
-            if not response_text:
-                print("[ELECTRS] Empty response from server")
-                return {}
-            
-            response = json.loads(response_text)
-            
-            if "error" in response and response["error"]:
-                print(f"[ELECTRS] RPC error: {response['error']}")
-                return {}
-            
-            return response.get("result", {})
+        request_timeout = timeout if timeout is not None else self.timeout
+        retry_delay = 2  # Start with 2 seconds
         
-        except socket.timeout:
-            print("[ELECTRS] Socket timeout")
-            return {}
-        except ConnectionRefusedError:
-            print(f"[ELECTRS] Connection refused to {self.host}:{self.port}")
-            return {}
+        for attempt in range(max_retries):
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # Set socket options for better connection handling
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # Disable Nagle's algorithm
+                sock.settimeout(request_timeout)
+                
+                if attempt > 0:
+                    print(f"[ELECTRS] Retry attempt {attempt + 1}/{max_retries}...")
+                    await asyncio.sleep(retry_delay * attempt)  # Exponential backoff
+                
+                print(f"[ELECTRS] Connecting to {self.host}:{self.port}...")
+                sock.connect((self.host, self.port))
+                
+                # Send JSON-RPC request
+                message = json.dumps(request) + "\n"
+                sock.sendall(message.encode('utf-8'))
+                
+                # Read response - Electrum protocol uses newline-delimited JSON
+                # Read until we get a complete line (JSON object)
+                response_data = b""
+                buffer = b""
+                start_time = time.time()
+                
+                while (time.time() - start_time) < request_timeout:
+                    try:
+                        sock.settimeout(2)  # Short timeout for each recv
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            # Connection closed
+                            break
+                        
+                        buffer += chunk
+                        
+                        # Check if we have a complete line (newline-delimited JSON)
+                        if b'\n' in buffer:
+                            # Split by newline and take the first complete message
+                            parts = buffer.split(b'\n', 1)
+                            response_data = parts[0]
+                            buffer = parts[1] if len(parts) > 1 else b""
+                            break
+                        
+                        # If buffer gets too large, something's wrong
+                        if len(buffer) > 100000:  # 100KB limit
+                            print("[ELECTRS] Response buffer too large, possible malformed response")
+                            break
+                            
+                    except socket.timeout:
+                        # If we have some data, try to use it
+                        if buffer:
+                            response_data = buffer
+                            buffer = b""
+                            break
+                        # Continue waiting if no data yet
+                        continue
+                
+                # Properly close the connection
+                if sock:
+                    try:
+                        # Shutdown before close for clean connection termination
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except (OSError, socket.error):
+                        # Ignore errors if already closed
+                        pass
+                    finally:
+                        sock.close()
+                        sock = None
+                
+                # Parse response
+                if not response_data:
+                    if attempt < max_retries - 1:
+                        print(f"[ELECTRS] Empty response, will retry...")
+                        continue
+                    print("[ELECTRS] Empty response from server after retries")
+                    return {}
+                
+                try:
+                    response_text = response_data.decode('utf-8').strip()
+                    response = json.loads(response_text)
+                    
+                    if "error" in response and response["error"]:
+                        error_msg = response["error"].get("message", str(response["error"]))
+                        # Don't retry on RPC errors (they're not transient)
+                        print(f"[ELECTRS] RPC error: {error_msg}")
+                        return {}
+                    
+                    return response.get("result", {})
+                except json.JSONDecodeError as e:
+                    if attempt < max_retries - 1:
+                        print(f"[ELECTRS] JSON decode error, will retry: {e}")
+                        continue
+                    print(f"[ELECTRS] JSON decode error: {e}")
+                    print(f"[ELECTRS] Response was: {response_data[:200]}")
+                    return {}
+            
+            except socket.timeout:
+                if sock:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except:
+                        pass
+                    sock.close()
+                if attempt < max_retries - 1:
+                    print(f"[ELECTRS] Socket timeout, will retry...")
+                    continue
+                print(f"[ELECTRS] Socket timeout after {request_timeout}s (all retries exhausted)")
+                return {}
+            except ConnectionRefusedError:
+                if sock:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except:
+                        pass
+                    sock.close()
+                if attempt < max_retries - 1:
+                    print(f"[ELECTRS] Connection refused, will retry...")
+                    continue
+                print(f"[ELECTRS] Connection refused to {self.host}:{self.port}")
+                return {}
+            except Exception as e:
+                if sock:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except:
+                        pass
+                    sock.close()
+                if attempt < max_retries - 1:
+                    print(f"[ELECTRS] Error (will retry): {str(e)[:100]}")
+                    continue
+                print(f"[ELECTRS] Socket error: {str(e)[:100]}")
+                return {}
+        
+        # All retries exhausted
+        return {}
+    
+    def _convert_electrum_tx_to_mempool_format(self, tx_data: Any, tx_hash: str, height: int) -> Dict[str, Any]:
+        """
+        Convert Electrum protocol transaction format to Mempool format (vout/vin with scriptpubkey_address)
+        
+        Electrum protocol's blockchain.transaction.get can return:
+        - Hex string (if verbose=False) - we can't parse this without a Bitcoin library
+        - Parsed dict (if verbose=True) - format varies by electrs version
+        
+        We convert to Mempool format which BitcoinAddressLinker expects:
+        - vout[].scriptpubkey_address
+        - vin[].prevout.scriptpubkey_address
+        """
+        try:
+            # Initialize the transaction object
+            tx_obj = {
+                "txid": tx_hash,
+                "hash": tx_hash,
+                "status": {
+                    "block_height": height if height > 0 else None,
+                    "confirmed": height > 0
+                },
+                "vin": [],
+                "vout": []
+            }
+            
+            # If tx_data is a string (hex), we can't parse it easily
+            if isinstance(tx_data, str):
+                print(f"[ELECTRS] Warning: Received hex transaction for {tx_hash[:16]}..., cannot extract addresses")
+                return tx_obj
+            
+            # If tx_data is a dict (parsed transaction)
+            if isinstance(tx_data, dict):
+                # Check if it's already in Mempool-compatible format
+                if "vout" in tx_data and "vin" in tx_data:
+                    # Already has vout/vin, ensure format matches
+                    tx_obj["vin"] = tx_data.get("vin", [])
+                    tx_obj["vout"] = tx_data.get("vout", [])
+                    
+                    # Ensure vout has scriptpubkey_address
+                    for vout in tx_obj["vout"]:
+                        if "scriptpubkey_address" not in vout:
+                            # Try to get from alternative fields
+                            vout["scriptpubkey_address"] = (
+                                vout.get("address") or
+                                vout.get("scriptPubKey", {}).get("address") if isinstance(vout.get("scriptPubKey"), dict) else None or
+                                None
+                            )
+                    
+                    # Ensure vin has prevout.scriptpubkey_address
+                    for vin in tx_obj["vin"]:
+                        if "prevout" not in vin:
+                            vin["prevout"] = {}
+                        if "scriptpubkey_address" not in vin.get("prevout", {}):
+                            # Try to get from alternative fields
+                            vin["prevout"]["scriptpubkey_address"] = (
+                                vin.get("address") or
+                                vin.get("prevout", {}).get("address") or
+                                vin.get("scriptPubKey", {}).get("address") if isinstance(vin.get("scriptPubKey"), dict) else None or
+                                None
+                            )
+                    
+                    return tx_obj
+                
+                # Electrum might return in different format - try to convert
+                if "inputs" in tx_data or "outputs" in tx_data:
+                    # Convert from Electrum format
+                    if "inputs" in tx_data:
+                        for inp in tx_data["inputs"]:
+                            vin_entry = {
+                                "txid": inp.get("prevout_hash", ""),
+                                "vout": inp.get("prevout_n", 0),
+                                "prevout": {}
+                            }
+                            # Try to get address from various possible fields
+                            address = (inp.get("address") or 
+                                      inp.get("prevout", {}).get("address") if isinstance(inp.get("prevout"), dict) else None or
+                                      inp.get("scriptpubkey_address"))
+                            if address:
+                                vin_entry["prevout"]["scriptpubkey_address"] = address
+                            if "value" in inp:
+                                vin_entry["prevout"]["value"] = inp["value"]
+                            tx_obj["vin"].append(vin_entry)
+                    
+                    if "outputs" in tx_data:
+                        for idx, out in enumerate(tx_data["outputs"]):
+                            vout_entry = {
+                                "value": out.get("value", 0),
+                                "n": idx
+                            }
+                            # Try to get address from various possible fields
+                            address = (out.get("address") or 
+                                      out.get("scriptpubkey_address") or
+                                      (out.get("script_pubkey", {}).get("address") if isinstance(out.get("script_pubkey"), dict) else None))
+                            if address:
+                                vout_entry["scriptpubkey_address"] = address
+                            tx_obj["vout"].append(vout_entry)
+                    
+                    return tx_obj
+            
+            # If we get here, we couldn't parse the format
+            print(f"[ELECTRS] Warning: Unknown transaction format for {tx_hash[:16]}...")
+            return tx_obj
+            
         except Exception as e:
-            print(f"[ELECTRS] Socket error: {str(e)[:100]}")
-            return {}
+            print(f"[ELECTRS] Error converting transaction format: {e}")
+            # Return minimal format as fallback
+            return {
+                "txid": tx_hash,
+                "hash": tx_hash,
+                "status": {"block_height": height if height > 0 else None},
+                "vin": [],
+                "vout": []
+            }
     
     async def get_address_transactions(self, address: str,
                                       start_block: Optional[int] = None,
                                       end_block: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Fetch transactions from Electrs using Electrum protocol"""
+        """Fetch transactions from Electrs using Electrum protocol with full transaction details"""
         
         try:
-            # Request address history using Electrum protocol
-            history = await self._send_request("blockchain.address.get_history", [address])
+            # Convert address to scripthash
+            scripthash = self._address_to_scripthash(address)
+            
+            if not scripthash:
+                print(f"[ELECTRS] Could not convert address {address} to scripthash")
+                print(f"[ELECTRS] Install base58 library: pip install base58")
+                return []
+            
+            # Step 1: Get transaction history (list of tx hashes)
+            history = await self._send_request("blockchain.scripthash.get_history", [scripthash])
             
             if not history or not isinstance(history, list):
                 print(f"[ELECTRS] No transactions found for {address}")
@@ -325,8 +589,8 @@ class ElectrsProvider(APIProvider):
             
             print(f"[ELECTRS] Found {len(history)} transaction entries")
             
-            # Convert history entries to transaction objects
-            transactions = []
+            # Step 2: Filter by block range and collect tx hashes
+            tx_hashes_to_fetch = []
             for entry in history:
                 tx_hash = entry.get("tx_hash")
                 height = entry.get("height", 0)
@@ -337,14 +601,54 @@ class ElectrsProvider(APIProvider):
                 if end_block and height > 0 and height > end_block:
                     continue
                 
-                transactions.append({
-                    "hash": tx_hash,
-                    "block_height": height if height > 0 else None,
-                    "tx_hash": tx_hash,
-                    "height": height
-                })
+                tx_hashes_to_fetch.append((tx_hash, height))
             
-            print(f"[ELECTRS] Filtered to {len(transactions)} transactions")
+            print(f"[ELECTRS] Fetching full details for {len(tx_hashes_to_fetch)} transactions")
+            
+            # Step 3: Fetch full transaction details for each
+            transactions = []
+            for idx, (tx_hash, height) in enumerate(tx_hashes_to_fetch):
+                try:
+                    # Fetch full transaction using blockchain.transaction.get
+                    # Try with verbose parameter first (some electrs versions support this)
+                    # If that fails, try without verbose (returns hex, which we can't parse)
+                    tx_data = await self._send_request("blockchain.transaction.get", [tx_hash, True])
+                    
+                    # If that returns empty or error, try without verbose flag
+                    if not tx_data or (isinstance(tx_data, str) and len(tx_data) < 100):
+                        tx_data = await self._send_request("blockchain.transaction.get", [tx_hash])
+                    
+                    if tx_data:
+                        # Convert to Mempool format
+                        tx_obj = self._convert_electrum_tx_to_mempool_format(tx_data, tx_hash, height)
+                        transactions.append(tx_obj)
+                    else:
+                        # Fallback: create minimal transaction object
+                        print(f"[ELECTRS] Warning: Could not fetch full details for {tx_hash[:16]}...")
+                        transactions.append({
+                            "txid": tx_hash,
+                            "hash": tx_hash,
+                            "status": {"block_height": height if height > 0 else None},
+                            "vin": [],
+                            "vout": []
+                        })
+                    
+                    # Small delay to avoid overwhelming electrs (every 10th transaction)
+                    if (idx + 1) % 10 == 0:
+                        await asyncio.sleep(0.1)
+                    
+                except Exception as e:
+                    print(f"[ELECTRS] Error fetching transaction {tx_hash[:16]}...: {str(e)[:50]}")
+                    # Add minimal transaction object as fallback
+                    transactions.append({
+                        "txid": tx_hash,
+                        "hash": tx_hash,
+                        "status": {"block_height": height if height > 0 else None},
+                        "vin": [],
+                        "vout": []
+                    })
+            
+            print(f"[ELECTRS] Retrieved {len(transactions)} full transaction details")
             return transactions
         
         except Exception as e:
@@ -381,7 +685,7 @@ def get_provider(provider_name: str = None) -> APIProvider:
 
     elif provider_name == "electrs":
         print("[API] Using Local Electrs Node")
-        return ElectrsProvider(host="100.94.34.56", port=50001, use_ssl=False)
+        return ElectrsProvider(host="192.168.7.218", port=50001, use_ssl=False)
 
 
     else:
