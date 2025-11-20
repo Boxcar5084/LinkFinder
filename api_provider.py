@@ -15,7 +15,15 @@ try:
     HAS_BASE58 = True
 except ImportError:
     HAS_BASE58 = False
-    print("[ELECTRS] Warning: base58 library not installed. Install with: pip install base58")
+    print("[ELECTRUMX] Warning: base58 library not installed. Install with: pip install base58")
+
+# For SSL support
+try:
+    import ssl
+    HAS_SSL = True
+except ImportError:
+    HAS_SSL = False
+    print("[ELECTRUMX] Warning: ssl module not available")
 
 
 class APIProvider(ABC):
@@ -251,16 +259,19 @@ class MempoolProvider(APIProvider):
         """Cleanup"""
         pass
 
-class ElectrsProvider(APIProvider):
-    """Local Electrs node provider using Electrum protocol (JSON-RPC over TCP)"""
+class ElectrumXProvider(APIProvider):
+    """ElectrumX server provider using Electrum protocol (JSON-RPC over TCP/SSL)"""
     
-    def __init__(self, host: str = "192.168.7.218", port: int = 50001, use_ssl: bool = False):
-        self.host = host
-        self.port = port
-        self.use_ssl = use_ssl
+    def __init__(self, host: str = None, port: int = None, use_ssl: bool = None, cert: str = None):
+        from config import ELECTRUMX_HOST, ELECTRUMX_PORT, ELECTRUMX_USE_SSL, ELECTRUMX_CERT
+        self.host = host if host is not None else ELECTRUMX_HOST
+        self.port = port if port is not None else ELECTRUMX_PORT
+        self.use_ssl = use_ssl if use_ssl is not None else ELECTRUMX_USE_SSL
+        self.cert = cert if cert is not None else ELECTRUMX_CERT
         self.timeout = 30
         self.request_id = 0
         self._connection_pool = None  # For future connection pooling
+        self._server_version = None  # Cached server version
     
     def _address_to_scripthash(self, address: str) -> Optional[str]:
         """
@@ -298,11 +309,29 @@ class ElectrsProvider(APIProvider):
             else:
                 return None
         except Exception as e:
-            print(f"[ELECTRS] Error converting address to scripthash: {e}")
+            print(f"[ELECTRUMX] Error converting address to scripthash: {e}")
             return None
     
+    async def _negotiate_version(self) -> bool:
+        """Negotiate server version with ElectrumX server"""
+        if self._server_version is not None:
+            return True  # Already negotiated
+        
+        try:
+            # Electrum protocol version negotiation
+            # Send server.version request
+            result = await self._send_request("server.version", ["linkfinder", "1.0"], timeout=10, max_retries=1)
+            if result:
+                self._server_version = result
+                print(f"[ELECTRUMX] Server version: {result}")
+                return True
+            return False
+        except Exception as e:
+            print(f"[ELECTRUMX] Version negotiation failed: {e}")
+            return False
+    
     async def _send_request(self, method: str, params: list, timeout: Optional[int] = None, max_retries: int = 3) -> Dict[str, Any]:
-        """Send a JSON-RPC request to Electrs over TCP with improved response handling and retry logic"""
+        """Send a JSON-RPC request to ElectrumX over TCP/SSL with improved response handling and retry logic"""
         self.request_id += 1
         
         request = {
@@ -317,19 +346,38 @@ class ElectrsProvider(APIProvider):
         
         for attempt in range(max_retries):
             sock = None
+            sock = None
             try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # Set socket options for better connection handling
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # Disable Nagle's algorithm
-                sock.settimeout(request_timeout)
-                
                 if attempt > 0:
-                    print(f"[ELECTRS] Retry attempt {attempt + 1}/{max_retries}...")
+                    print(f"[ELECTRUMX] Retry attempt {attempt + 1}/{max_retries}...")
                     await asyncio.sleep(retry_delay * attempt)  # Exponential backoff
                 
-                print(f"[ELECTRS] Connecting to {self.host}:{self.port}...")
-                sock.connect((self.host, self.port))
+                # Create socket with SSL support
+                if self.use_ssl and HAS_SSL:
+                    print(f"[ELECTRUMX] Connecting to {self.host}:{self.port} (SSL)...")
+                    # Create SSL context
+                    context = ssl.create_default_context()
+                    if self.cert:
+                        context.load_verify_locations(self.cert)
+                    else:
+                        context.check_hostname = False
+                        context.verify_mode = ssl.CERT_NONE
+                    
+                    # Create TCP socket first
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.settimeout(request_timeout)
+                    sock.connect((self.host, self.port))
+                    # Wrap with SSL
+                    sock = context.wrap_socket(sock, server_hostname=self.host)
+                else:
+                    print(f"[ELECTRUMX] Connecting to {self.host}:{self.port} (TCP)...")
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.settimeout(request_timeout)
+                    sock.connect((self.host, self.port))
                 
                 # Send JSON-RPC request
                 message = json.dumps(request) + "\n"
@@ -361,7 +409,7 @@ class ElectrsProvider(APIProvider):
                         
                         # If buffer gets too large, something's wrong
                         if len(buffer) > 100000:  # 100KB limit
-                            print("[ELECTRS] Response buffer too large, possible malformed response")
+                            print("[ELECTRUMX] Response buffer too large, possible malformed response")
                             break
                             
                     except socket.timeout:
@@ -377,7 +425,8 @@ class ElectrsProvider(APIProvider):
                 if sock:
                     try:
                         # Shutdown before close for clean connection termination
-                        sock.shutdown(socket.SHUT_RDWR)
+                        if hasattr(sock, 'shutdown'):
+                            sock.shutdown(socket.SHUT_RDWR)
                     except (OSError, socket.error):
                         # Ignore errors if already closed
                         pass
@@ -388,9 +437,9 @@ class ElectrsProvider(APIProvider):
                 # Parse response
                 if not response_data:
                     if attempt < max_retries - 1:
-                        print(f"[ELECTRS] Empty response, will retry...")
+                        print(f"[ELECTRUMX] Empty response, will retry...")
                         continue
-                    print("[ELECTRS] Empty response from server after retries")
+                    print("[ELECTRUMX] Empty response from server after retries")
                     return {}
                 
                 try:
@@ -400,53 +449,56 @@ class ElectrsProvider(APIProvider):
                     if "error" in response and response["error"]:
                         error_msg = response["error"].get("message", str(response["error"]))
                         # Don't retry on RPC errors (they're not transient)
-                        print(f"[ELECTRS] RPC error: {error_msg}")
+                        print(f"[ELECTRUMX] RPC error: {error_msg}")
                         return {}
                     
                     return response.get("result", {})
                 except json.JSONDecodeError as e:
                     if attempt < max_retries - 1:
-                        print(f"[ELECTRS] JSON decode error, will retry: {e}")
+                        print(f"[ELECTRUMX] JSON decode error, will retry: {e}")
                         continue
-                    print(f"[ELECTRS] JSON decode error: {e}")
-                    print(f"[ELECTRS] Response was: {response_data[:200]}")
+                    print(f"[ELECTRUMX] JSON decode error: {e}")
+                    print(f"[ELECTRUMX] Response was: {response_data[:200]}")
                     return {}
             
             except socket.timeout:
                 if sock:
                     try:
-                        sock.shutdown(socket.SHUT_RDWR)
+                        if hasattr(sock, 'shutdown'):
+                            sock.shutdown(socket.SHUT_RDWR)
                     except:
                         pass
                     sock.close()
                 if attempt < max_retries - 1:
-                    print(f"[ELECTRS] Socket timeout, will retry...")
+                    print(f"[ELECTRUMX] Socket timeout, will retry...")
                     continue
-                print(f"[ELECTRS] Socket timeout after {request_timeout}s (all retries exhausted)")
+                print(f"[ELECTRUMX] Socket timeout after {request_timeout}s (all retries exhausted)")
                 return {}
             except ConnectionRefusedError:
                 if sock:
                     try:
-                        sock.shutdown(socket.SHUT_RDWR)
+                        if hasattr(sock, 'shutdown'):
+                            sock.shutdown(socket.SHUT_RDWR)
                     except:
                         pass
                     sock.close()
                 if attempt < max_retries - 1:
-                    print(f"[ELECTRS] Connection refused, will retry...")
+                    print(f"[ELECTRUMX] Connection refused, will retry...")
                     continue
-                print(f"[ELECTRS] Connection refused to {self.host}:{self.port}")
+                print(f"[ELECTRUMX] Connection refused to {self.host}:{self.port}")
                 return {}
             except Exception as e:
                 if sock:
                     try:
-                        sock.shutdown(socket.SHUT_RDWR)
+                        if hasattr(sock, 'shutdown'):
+                            sock.shutdown(socket.SHUT_RDWR)
                     except:
                         pass
                     sock.close()
                 if attempt < max_retries - 1:
-                    print(f"[ELECTRS] Error (will retry): {str(e)[:100]}")
+                    print(f"[ELECTRUMX] Error (will retry): {str(e)[:100]}")
                     continue
-                print(f"[ELECTRS] Socket error: {str(e)[:100]}")
+                print(f"[ELECTRUMX] Socket error: {str(e)[:100]}")
                 return {}
         
         # All retries exhausted
@@ -458,7 +510,7 @@ class ElectrsProvider(APIProvider):
         
         Electrum protocol's blockchain.transaction.get can return:
         - Hex string (if verbose=False) - we can't parse this without a Bitcoin library
-        - Parsed dict (if verbose=True) - format varies by electrs version
+        - Parsed dict (if verbose=True) - format varies by ElectrumX version
         
         We convert to Mempool format which BitcoinAddressLinker expects:
         - vout[].scriptpubkey_address
@@ -479,7 +531,7 @@ class ElectrsProvider(APIProvider):
             
             # If tx_data is a string (hex), we can't parse it easily
             if isinstance(tx_data, str):
-                print(f"[ELECTRS] Warning: Received hex transaction for {tx_hash[:16]}..., cannot extract addresses")
+                print(f"[ELECTRUMX] Warning: Received hex transaction for {tx_hash[:16]}..., cannot extract addresses")
                 return tx_obj
             
             # If tx_data is a dict (parsed transaction)
@@ -552,11 +604,11 @@ class ElectrsProvider(APIProvider):
                     return tx_obj
             
             # If we get here, we couldn't parse the format
-            print(f"[ELECTRS] Warning: Unknown transaction format for {tx_hash[:16]}...")
+            print(f"[ELECTRUMX] Warning: Unknown transaction format for {tx_hash[:16]}...")
             return tx_obj
             
         except Exception as e:
-            print(f"[ELECTRS] Error converting transaction format: {e}")
+            print(f"[ELECTRUMX] Error converting transaction format: {e}")
             # Return minimal format as fallback
             return {
                 "txid": tx_hash,
@@ -569,25 +621,29 @@ class ElectrsProvider(APIProvider):
     async def get_address_transactions(self, address: str,
                                       start_block: Optional[int] = None,
                                       end_block: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Fetch transactions from Electrs using Electrum protocol with full transaction details"""
+        """Fetch transactions from ElectrumX using Electrum protocol with full transaction details"""
         
         try:
+            # Negotiate version on first connection
+            if self._server_version is None:
+                await self._negotiate_version()
+            
             # Convert address to scripthash
             scripthash = self._address_to_scripthash(address)
             
             if not scripthash:
-                print(f"[ELECTRS] Could not convert address {address} to scripthash")
-                print(f"[ELECTRS] Install base58 library: pip install base58")
+                print(f"[ELECTRUMX] Could not convert address {address} to scripthash")
+                print(f"[ELECTRUMX] Install base58 library: pip install base58")
                 return []
             
             # Step 1: Get transaction history (list of tx hashes)
             history = await self._send_request("blockchain.scripthash.get_history", [scripthash])
             
             if not history or not isinstance(history, list):
-                print(f"[ELECTRS] No transactions found for {address}")
+                print(f"[ELECTRUMX] No transactions found for {address}")
                 return []
             
-            print(f"[ELECTRS] Found {len(history)} transaction entries")
+            print(f"[ELECTRUMX] Found {len(history)} transaction entries")
             
             # Step 2: Filter by block range and collect tx hashes
             tx_hashes_to_fetch = []
@@ -603,14 +659,14 @@ class ElectrsProvider(APIProvider):
                 
                 tx_hashes_to_fetch.append((tx_hash, height))
             
-            print(f"[ELECTRS] Fetching full details for {len(tx_hashes_to_fetch)} transactions")
+            print(f"[ELECTRUMX] Fetching full details for {len(tx_hashes_to_fetch)} transactions")
             
             # Step 3: Fetch full transaction details for each
             transactions = []
             for idx, (tx_hash, height) in enumerate(tx_hashes_to_fetch):
                 try:
                     # Fetch full transaction using blockchain.transaction.get
-                    # Try with verbose parameter first (some electrs versions support this)
+                    # Try with verbose parameter first (ElectrumX supports this)
                     # If that fails, try without verbose (returns hex, which we can't parse)
                     tx_data = await self._send_request("blockchain.transaction.get", [tx_hash, True])
                     
@@ -624,7 +680,7 @@ class ElectrsProvider(APIProvider):
                         transactions.append(tx_obj)
                     else:
                         # Fallback: create minimal transaction object
-                        print(f"[ELECTRS] Warning: Could not fetch full details for {tx_hash[:16]}...")
+                        print(f"[ELECTRUMX] Warning: Could not fetch full details for {tx_hash[:16]}...")
                         transactions.append({
                             "txid": tx_hash,
                             "hash": tx_hash,
@@ -633,12 +689,12 @@ class ElectrsProvider(APIProvider):
                             "vout": []
                         })
                     
-                    # Small delay to avoid overwhelming electrs (every 10th transaction)
+                    # Small delay to avoid overwhelming ElectrumX (every 10th transaction)
                     if (idx + 1) % 10 == 0:
                         await asyncio.sleep(0.1)
                     
                 except Exception as e:
-                    print(f"[ELECTRS] Error fetching transaction {tx_hash[:16]}...: {str(e)[:50]}")
+                    print(f"[ELECTRUMX] Error fetching transaction {tx_hash[:16]}...: {str(e)[:50]}")
                     # Add minimal transaction object as fallback
                     transactions.append({
                         "txid": tx_hash,
@@ -648,12 +704,56 @@ class ElectrsProvider(APIProvider):
                         "vout": []
                     })
             
-            print(f"[ELECTRS] Retrieved {len(transactions)} full transaction details")
+            print(f"[ELECTRUMX] Retrieved {len(transactions)} full transaction details")
             return transactions
         
         except Exception as e:
-            print(f"[ELECTRS] Error fetching transactions: {str(e)[:100]}")
+            print(f"[ELECTRUMX] Error fetching transactions: {str(e)[:100]}")
             return []
+    
+    async def get_balance(self, address: str) -> Dict[str, Any]:
+        """Get balance for an address"""
+        try:
+            scripthash = self._address_to_scripthash(address)
+            if not scripthash:
+                return {"confirmed": 0, "unconfirmed": 0}
+            
+            balance = await self._send_request("blockchain.scripthash.get_balance", [scripthash])
+            if balance and isinstance(balance, dict):
+                return {
+                    "confirmed": balance.get("confirmed", 0),
+                    "unconfirmed": balance.get("unconfirmed", 0)
+                }
+            return {"confirmed": 0, "unconfirmed": 0}
+        except Exception as e:
+            print(f"[ELECTRUMX] Error getting balance: {e}")
+            return {"confirmed": 0, "unconfirmed": 0}
+    
+    async def get_utxos(self, address: str) -> List[Dict[str, Any]]:
+        """Get UTXOs for an address"""
+        try:
+            scripthash = self._address_to_scripthash(address)
+            if not scripthash:
+                return []
+            
+            utxos = await self._send_request("blockchain.scripthash.listunspent", [scripthash])
+            if utxos and isinstance(utxos, list):
+                return utxos
+            return []
+        except Exception as e:
+            print(f"[ELECTRUMX] Error getting UTXOs: {e}")
+            return []
+    
+    async def broadcast(self, raw_tx: str) -> str:
+        """Broadcast a raw transaction to the network"""
+        try:
+            result = await self._send_request("blockchain.transaction.broadcast", [raw_tx])
+            if result and isinstance(result, str):
+                return result
+            raise Exception(f"Broadcast failed: {result}")
+        except Exception as e:
+            print(f"[ELECTRUMX] Error broadcasting transaction: {e}")
+            raise
     
     async def close(self):
         """Cleanup"""
@@ -665,7 +765,7 @@ def get_provider(provider_name: str = None) -> APIProvider:
     Factory function to get the appropriate API provider
     
     Args:
-        provider_name: "blockchain", "mempool", "electrs", or None (uses DEFAULT_API from config)
+        provider_name: "blockchain", "mempool", "electrumx", or None (uses DEFAULT_API from config)
     
     Returns:
         APIProvider instance
@@ -683,13 +783,29 @@ def get_provider(provider_name: str = None) -> APIProvider:
         print("[API] Using Mempool.space API")
         return MempoolProvider()
 
+    elif provider_name == "electrumx":
+        print("[API] Using ElectrumX Node")
+        from config import ELECTRUMX_HOST, ELECTRUMX_PORT, ELECTRUMX_USE_SSL, ELECTRUMX_CERT
+        return ElectrumXProvider(
+            host=ELECTRUMX_HOST,
+            port=ELECTRUMX_PORT,
+            use_ssl=ELECTRUMX_USE_SSL,
+            cert=ELECTRUMX_CERT
+        )
+    
     elif provider_name == "electrs":
-        print("[API] Using Local Electrs Node")
-        return ElectrsProvider(host="192.168.7.218", port=50001, use_ssl=False)
-
+        # Legacy support - map to ElectrumXProvider
+        print("[API] WARNING: 'electrs' provider is deprecated, using ElectrumX instead")
+        from config import ELECTRUMX_HOST, ELECTRUMX_PORT, ELECTRUMX_USE_SSL, ELECTRUMX_CERT
+        return ElectrumXProvider(
+            host=ELECTRUMX_HOST,
+            port=ELECTRUMX_PORT,
+            use_ssl=ELECTRUMX_USE_SSL,
+            cert=ELECTRUMX_CERT
+        )
 
     else:
-        raise ValueError(f"Unknown provider: {provider_name}. Use 'blockchain', 'mempool', or 'electrs'")
+        raise ValueError(f"Unknown provider: {provider_name}. Use 'blockchain', 'mempool', or 'electrumx'")
 
 
 async def test_provider(provider_name: str = None, test_address: str = "1A1z7agoat4FqCnf4Xy7jJn1eJd7azHXzA"):
@@ -720,7 +836,7 @@ if __name__ == "__main__":
         print("Testing all API providers...\n")
 
         # Test each provider
-        for provider in ["blockchain", "mempool", "electrs"]:
+        for provider in ["blockchain", "mempool", "electrumx"]:
             try:
                 await test_provider(provider)
             except Exception as e:

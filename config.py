@@ -18,18 +18,28 @@ Path(EXPORT_DIR).mkdir(parents=True, exist_ok=True)
 class APIProvider(Enum):
     BLOCKCHAIR = "blockchair"
     MEMPOOL = "mempool"
-    ELECTRS = "electrs"
+    ELECTRUMX = "electrumx"
     BLOCKCHAIN = "blockchain"
+    # Legacy - kept for backwards compatibility during migration
+    ELECTRS = "electrs"
 
 # Configuration
-DEFAULT_API = "electrs"  # Start with Mempool (public, no auth)
+DEFAULT_API = "electrumx"  # Default to ElectrumX
 
 BLOCKCHAIR_API_URL = "https://api.blockchair.com/bitcoin"
 BLOCKCHAIN_API_URL = "https://blockchain.info"
 MEMPOOL_API_URL = "https://mempool.space/api"
-ELECTRS_LOCAL_URL = "tcp://192.168.7.218:50001"  # TCP socket connection, not HTTP
-ELECTRS_HOST = "192.168.7.218"
-ELECTRS_PORT = 50001
+
+# ElectrumX Configuration (Electrum protocol over TCP/SSL)
+ELECTRUMX_HOST = os.getenv("ELECTRUMX_HOST", "192.168.7.218")
+ELECTRUMX_PORT = int(os.getenv("ELECTRUMX_PORT", "50001"))
+ELECTRUMX_USE_SSL = os.getenv("ELECTRUMX_USE_SSL", "false").lower() == "true"
+ELECTRUMX_CERT = os.getenv("ELECTRUMX_CERT", None)  # Optional: path to SSL certificate
+
+# Legacy electrs config (deprecated - will be removed)
+ELECTRS_LOCAL_URL = "tcp://192.168.7.218:50001"  # Deprecated
+ELECTRS_HOST = "192.168.7.218"  # Deprecated
+ELECTRS_PORT = 50001  # Deprecated
 
 
 MIXER_INPUT_THRESHOLD = 30          # Min inputs to be considered "mixer-like"  100-100-50

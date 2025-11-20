@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test the actual ElectrsProvider with multiple sequential address queries
+Test the actual ElectrumXProvider with multiple sequential address queries
 This simulates real-world usage patterns
 """
 import asyncio
@@ -8,13 +8,13 @@ import sys
 from api_provider import get_provider
 
 async def test_provider_sequential():
-    """Test ElectrsProvider with multiple sequential address queries"""
+    """Test ElectrumXProvider with multiple sequential address queries"""
     print("\n" + "="*60)
-    print("ELECTRS PROVIDER SEQUENTIAL TEST")
+    print("ELECTRUMX PROVIDER SEQUENTIAL TEST")
     print("="*60)
     print("Testing real provider usage patterns\n")
     
-    provider = get_provider("electrs")
+    provider = get_provider("electrumx")
     
     # Test addresses (mix of known addresses)
     test_addresses = [
@@ -57,16 +57,16 @@ async def test_provider_sequential():
     
     if results[0] and not all(results[1:]):
         print("\n⚠️  PATTERN DETECTED: First query works, subsequent fail!")
-        print("   This indicates electrs connection handling issues.")
+        print("   This indicates ElectrumX connection handling issues.")
         print("\n   Solutions:")
-        print("   1. Check electrs.toml configuration (see electrs_config_guide.md)")
-        print("   2. Increase max_connections in electrs config")
-        print("   3. Check Docker resource limits")
-        print("   4. Review electrs logs: docker logs electrs")
+        print("   1. Check ElectrumX server configuration")
+        print("   2. Check network connectivity to ElectrumX server")
+        print("   3. Verify ELECTRUMX_HOST and ELECTRUMX_PORT settings")
+        print("   4. Check ElectrumX server logs")
     elif all(results):
         print("\n✓ All queries succeeded - provider is working correctly")
     else:
-        print("\n✗ Some queries failed - check electrs status and configuration")
+        print("\n✗ Some queries failed - check ElectrumX server status and configuration")
 
 if __name__ == "__main__":
     try:
