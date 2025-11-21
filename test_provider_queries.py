@@ -21,6 +21,7 @@ async def test_provider_sequential():
     test_addresses = [
         "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",  # Genesis block (block 0)
         "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",  # Repeat genesis (most reliable)
+        "38YEkk8pKA1DXWhQTdW53ibXUaFDYqk269",
     ]
     
     results = []
