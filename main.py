@@ -93,9 +93,25 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
             cache_manager,
             session_id,
             sessions,
-            checkpoint_state=checkpoint_state
+            checkpoint_state=checkpoint_state,
+            export_manager=export_manager
         )
         print(f"[MAIN] Linker created, cache in linker: {linker.linker.cache}")
+
+        # Initialize incremental exports
+        csv_path, json_path = export_manager.initialize_incremental_export(session_id)
+        sessions[session_id]['exports'] = {'csv': csv_path, 'json': json_path}
+
+        # Create connection callback for incremental exports
+        def connection_callback(connection, total_addresses, search_depth, block_range, status):
+            export_manager.append_connection(
+                session_id,
+                connection,
+                total_addresses,
+                search_depth,
+                block_range,
+                status
+            )
 
         # NEW: Start periodic checkpoint task
         checkpoint_task = asyncio.create_task(
@@ -106,10 +122,12 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
             request.list_a, request.list_b,
             request.max_depth,
             request.start_block,
-            request.end_block
+            request.end_block,
+            connection_callback=connection_callback
         )
 
-        csv_path, json_path = export_manager.export_both(results, session_id)
+        # Finalize incremental exports
+        csv_path, json_path = export_manager.finalize_incremental_export(session_id, results)
 
         # FIX #2: Update all session fields atomically
         sessions[session_id].update({
@@ -238,16 +256,18 @@ async def _periodic_checkpoint_task(session_id: str):
 class BitcoinAddressLinkerWithCheckpoint:
     """Extended linker that updates session state for checkpointing AND loads from checkpoint"""
 
-    def __init__(self, api, cache_manager, session_id, sessions_dict, checkpoint_state=None):
+    def __init__(self, api, cache_manager, session_id, sessions_dict, checkpoint_state=None, export_manager=None):
         from graph_engine import BitcoinAddressLinker
         self.linker = BitcoinAddressLinker(api, cache_manager)
         self.session_id = session_id
         self.sessions = sessions_dict
+        self.export_manager = export_manager  # Use the global export_manager instance
         
         # Load checkpoint state if resuming
         self.checkpoint_state = checkpoint_state or {}
 
-    async def find_connection(self, list_a, list_b, max_depth, start_block, end_block):
+    async def find_connection(self, list_a, list_b, max_depth, start_block, end_block, 
+                             connection_callback=None):
         """Find connections while updating trace state and loading from checkpoint"""
         
         if self.checkpoint_state:
@@ -304,13 +324,15 @@ class BitcoinAddressLinkerWithCheckpoint:
                 visited_backward=visited_backward,
                 queued_forward=queued_forward,     # PASS QUEUED FORWARD
                 queued_backward=queued_backward,   # PASS QUEUED BACKWARD
-                progress_callback=self._progress_callback
+                progress_callback=self._progress_callback,
+                connection_callback=connection_callback
             )
         else:
             # FRESH TRACE - call find_connection FIRST
             result = await self.linker.find_connection(
                 list_a, list_b, max_depth, start_block, end_block,
-                progress_callback=self._progress_callback
+                progress_callback=self._progress_callback,
+                connection_callback=connection_callback
             )
 
         # AFTER getting result, extract visited state for checkpoint

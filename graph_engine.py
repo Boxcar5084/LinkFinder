@@ -14,7 +14,8 @@ from config import (
     SKIP_MIXER_INPUT_THRESHOLD,
     SKIP_MIXER_OUTPUT_THRESHOLD,
     SKIP_DISTRIBUTION_MAX_INPUTS,
-    SKIP_DISTRIBUTION_MIN_OUTPUTS
+    SKIP_DISTRIBUTION_MIN_OUTPUTS,
+    EXCHANGE_WALLET_THRESHOLD
 )
 
 
@@ -26,6 +27,7 @@ class BitcoinAddressLinker:
         self.api = api_provider
         self.cache = cache_manager
         self.max_tx_per_address = max_tx_per_address
+        self._exchange_wallet_cache = {}  # Cache exchange wallet status
         print(f"[GRAPH_ENGINE] Initialized with cache_manager: {cache_manager}")
 
     def _extract_addresses(self, tx: Dict[str, Any], direction: str = 'output') -> Set[str]:
@@ -101,6 +103,36 @@ class BitcoinAddressLinker:
         except:
             return False
 
+    async def _is_exchange_wallet(self, address: str,
+                                  start_block: Optional[int] = None,
+                                  end_block: Optional[int] = None) -> bool:
+        """
+        Check if an address is an exchange wallet (has excessive transactions).
+        Uses cached status to avoid repeated API calls.
+        This is a lightweight check that uses the cache first.
+        """
+        # Check cache first
+        if address in self._exchange_wallet_cache:
+            return self._exchange_wallet_cache[address]
+        
+        # Check if we have cached transactions - if so, use that count
+        block_range = (start_block, end_block) if (start_block or end_block) else None
+        cached_txs = self.cache.get_cached(address, block_range)
+        
+        if cached_txs is not None:
+            # We have cached transactions, check the count
+            # If cached count is >= threshold, we know it's an exchange wallet
+            if len(cached_txs) >= EXCHANGE_WALLET_THRESHOLD:
+                self._exchange_wallet_cache[address] = True
+                return True
+            # If cached and below threshold, mark as not exchange
+            self._exchange_wallet_cache[address] = False
+            return False
+        
+        # No cache - we don't know yet, but we'll find out when get_address_txs is called
+        # For now, assume not an exchange wallet (will be updated when transactions are fetched)
+        return False
+
     def _should_skip_transaction(self, tx: Dict[str, Any]) -> bool:
         """
         Skip transactions that break analysis chains.
@@ -147,9 +179,20 @@ class BitcoinAddressLinker:
         """Fetch transactions with smart filtering"""
         block_range = (start_block, end_block) if (start_block or end_block) else None
 
+        # Check cache for exchange wallet status first
+        if address in self._exchange_wallet_cache and self._exchange_wallet_cache[address]:
+            print(f"  [SKIP] Skipping exchange wallet (cached): {address}")
+            return []
+
         # Try to get from cache FIRST
         cached = self.cache.get_cached(address, block_range)
         if cached:
+            # Check if cached address is an exchange wallet
+            # If we have cached transactions and count is > threshold, mark as exchange
+            if len(cached) >= EXCHANGE_WALLET_THRESHOLD:
+                self._exchange_wallet_cache[address] = True
+                print(f"  [SKIP] Skipping exchange wallet (from cache): {address} ({len(cached)} transactions)")
+                return []
             return cached
 
         print(f"[*] Fetching: {address}")
@@ -159,6 +202,15 @@ class BitcoinAddressLinker:
         if not isinstance(txs, list):
             print(f"  [WARN] API returned non-list: {type(txs)}")
             return []
+
+        # Check if this is an exchange wallet based on transaction count
+        if len(txs) > EXCHANGE_WALLET_THRESHOLD:
+            self._exchange_wallet_cache[address] = True
+            print(f"  [SKIP] Exchange wallet detected: {address} ({len(txs)} transactions)")
+            return []
+
+        # Mark as not an exchange wallet
+        self._exchange_wallet_cache[address] = False
 
         filtered_txs = []
         
@@ -202,7 +254,8 @@ class BitcoinAddressLinker:
                             max_depth: int = 5,
                             start_block: Optional[int] = None,
                             end_block: Optional[int] = None,
-                            progress_callback=None) -> Dict[str, Any]:
+                            progress_callback=None,
+                            connection_callback=None) -> Dict[str, Any]:
         """Fresh trace - calls find_connection_with_visited_state with empty state"""
         return await self.find_connection_with_visited_state(
             list_a, list_b, max_depth, start_block, end_block,
@@ -210,7 +263,8 @@ class BitcoinAddressLinker:
             visited_backward=None,
             queued_forward=None,
             queued_backward=None,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
+            connection_callback=connection_callback
         )
 
 
@@ -222,7 +276,8 @@ class BitcoinAddressLinker:
                                                 visited_backward: Union[Dict, Set, List] = None,
                                                 queued_forward: Union[List] = None,
                                                 queued_backward: Union[List] = None,
-                                                progress_callback=None) -> Dict[str, Any]:
+                                                progress_callback=None,
+                                                connection_callback=None) -> Dict[str, Any]:
         """Resume from checkpoint with proper queue reconstruction"""
 
         # Convert visited types to proper format
@@ -251,6 +306,9 @@ class BitcoinAddressLinker:
             'block_range': (start_block, end_block),
             'status': 'searching'
         }
+        
+        # Track which list_b addresses have been matched
+        matched_targets = set()
 
         print(f"\n[LINK] Linking {len(list_a)} addresses with {len(list_b)} addresses")
         print(f" Max Depth: {max_depth}")
@@ -372,6 +430,11 @@ class BitcoinAddressLinker:
                         for neighbor in outputs:
                             if neighbor in forward_discovered:
                                 continue
+                            
+                            # Skip exchange wallets
+                            if await self._is_exchange_wallet(neighbor, start_block, end_block):
+                                print(f"    [SKIP] Exchange wallet neighbor: {neighbor}")
+                                continue
 
                             new_path = path + [neighbor]
 
@@ -379,27 +442,56 @@ class BitcoinAddressLinker:
                             if neighbor in backward_discovered:
                                 backward_path = backward_discovered[neighbor]
                                 full_path = new_path + list(reversed(backward_path[1:]))
+                                target_addr = full_path[-1]
                                 
-                                print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
+                                print(f"\n[✓] MEETING POINT FOUND: {neighbor}")
                                 print(f" Path: {' -> '.join(full_path)}")
+                                print(f" Source: {full_path[0]} -> Target: {target_addr}")
                                 
-                                results['connections_found'].append({
+                                # Create connection object
+                                connection = {
                                     'source': full_path[0],
-                                    'target': full_path[-1],
+                                    'target': target_addr,
                                     'path': full_path,
                                     'path_length': len(full_path),
                                     'path_count': len(full_path),
                                     'meeting_points': full_path,
                                     'found_at_depth': current_depth,
                                     'direction': 'forward_meets_backward'
-                                })
+                                }
+                                
+                                # Add connection to results
+                                results['connections_found'].append(connection)
+                                
+                                # Mark this target as matched
+                                matched_targets.add(target_addr)
                                 results['status'] = 'connected'
-                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-                                results['visited_forward'] = forward_discovered
-                                results['visited_backward'] = backward_discovered
-                                results['queued_forward'] = [item[0] for item in list(forward_queue)]
-                                results['queued_backward'] = [item[0] for item in list(backward_queue)]
-                                return results
+                                
+                                # Update exports immediately if callback provided
+                                if connection_callback:
+                                    try:
+                                        connection_callback(
+                                            connection,
+                                            len(forward_visited) + len(backward_visited),
+                                            max_depth,
+                                            (start_block, end_block),
+                                            'connected'
+                                        )
+                                    except Exception as e:
+                                        print(f"  [WARN] Error in connection callback: {e}")
+                                
+                                # Continue searching - don't return yet
+                                print(f"  [CONTINUE] Found {len(results['connections_found'])} connection(s), continuing search...")
+                                
+                                # Check if all list_b addresses have been matched
+                                if len(matched_targets) >= len(list_b):
+                                    print(f"\n[✓] All {len(list_b)} target addresses matched!")
+                                    results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
+                                    results['visited_forward'] = forward_discovered
+                                    results['visited_backward'] = backward_discovered
+                                    results['queued_forward'] = [item[0] for item in list(forward_queue)]
+                                    results['queued_backward'] = [item[0] for item in list(backward_queue)]
+                                    return results
 
                             forward_discovered[neighbor] = new_path
                             forward_queue.append((neighbor, new_path))
@@ -447,6 +539,11 @@ class BitcoinAddressLinker:
                         for neighbor in inputs:
                             if neighbor in backward_discovered:
                                 continue
+                            
+                            # Skip exchange wallets
+                            if await self._is_exchange_wallet(neighbor, start_block, end_block):
+                                print(f"    [SKIP] Exchange wallet neighbor: {neighbor}")
+                                continue
 
                             new_path = path + [neighbor]
 
@@ -454,27 +551,56 @@ class BitcoinAddressLinker:
                             if neighbor in forward_discovered:
                                 forward_path = forward_discovered[neighbor]
                                 full_path = forward_path + list(reversed(new_path[1:]))
+                                target_addr = full_path[-1]
                                 
-                                print(f"\n[âœ“] MEETING POINT FOUND: {neighbor}")
+                                print(f"\n[✓] MEETING POINT FOUND: {neighbor}")
                                 print(f" Path: {' -> '.join(full_path)}")
+                                print(f" Source: {full_path[0]} -> Target: {target_addr}")
                                 
-                                results['connections_found'].append({
+                                # Create connection object
+                                connection = {
                                     'source': full_path[0],
-                                    'target': full_path[-1],
+                                    'target': target_addr,
                                     'path': full_path,
                                     'path_length': len(full_path),
                                     'path_count': len(full_path),
                                     'meeting_points': full_path,
                                     'found_at_depth': current_depth,
                                     'direction': 'backward_meets_forward'
-                                })
+                                }
+                                
+                                # Add connection to results
+                                results['connections_found'].append(connection)
+                                
+                                # Mark this target as matched
+                                matched_targets.add(target_addr)
                                 results['status'] = 'connected'
-                                results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
-                                results['visited_forward'] = forward_discovered
-                                results['visited_backward'] = backward_discovered
-                                results['queued_forward'] = [item[0] for item in list(forward_queue)]
-                                results['queued_backward'] = [item[0] for item in list(backward_queue)]
-                                return results
+                                
+                                # Update exports immediately if callback provided
+                                if connection_callback:
+                                    try:
+                                        connection_callback(
+                                            connection,
+                                            len(forward_visited) + len(backward_visited),
+                                            max_depth,
+                                            (start_block, end_block),
+                                            'connected'
+                                        )
+                                    except Exception as e:
+                                        print(f"  [WARN] Error in connection callback: {e}")
+                                
+                                # Continue searching - don't return yet
+                                print(f"  [CONTINUE] Found {len(results['connections_found'])} connection(s), continuing search...")
+                                
+                                # Check if all list_b addresses have been matched
+                                if len(matched_targets) >= len(list_b):
+                                    print(f"\n[✓] All {len(list_b)} target addresses matched!")
+                                    results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
+                                    results['visited_forward'] = forward_discovered
+                                    results['visited_backward'] = backward_discovered
+                                    results['queued_forward'] = [item[0] for item in list(forward_queue)]
+                                    results['queued_backward'] = [item[0] for item in list(backward_queue)]
+                                    return results
 
                             backward_discovered[neighbor] = new_path
                             backward_queue.append((neighbor, new_path))
@@ -489,19 +615,28 @@ class BitcoinAddressLinker:
             print(f"\n[STATUS] Depth {current_depth}:")
             print(f" Forward: visited={len(forward_visited)}, discovered={len(forward_discovered)}, queue={len(forward_queue)}")
             print(f" Backward: visited={len(backward_visited)}, discovered={len(backward_discovered)}, queue={len(backward_queue)}")
+            print(f" Connections found: {len(results['connections_found'])}")
+            print(f" Matched targets: {len(matched_targets)}/{len(list_b)}")
 
             if not forward_queue and not backward_queue:
                 print(f"\n[!] Both queues exhausted at depth {current_depth}")
                 break
 
-        results['status'] = 'no_connection'
+        # Finalize results
+        if len(results['connections_found']) > 0:
+            results['status'] = 'connected'
+            print(f"\n[✓] Search completed. Found {len(results['connections_found'])} connection(s)")
+            print(f" Matched {len(matched_targets)} out of {len(list_b)} target addresses")
+        else:
+            results['status'] = 'no_connection'
+            print(f"\n[✗] No connections found")
+        
         results['total_addresses_examined'] = len(forward_visited) + len(backward_visited)
         results['visited_forward'] = forward_discovered
         results['visited_backward'] = backward_discovered
         results['queued_forward'] = [item[0] for item in list(forward_queue)]
         results['queued_backward'] = [item[0] for item in list(backward_queue)]
-
-        print(f"\n[âœ—] No connection found")
+        
         print(f" Total addresses examined: {results['total_addresses_examined']}")
         
         return results

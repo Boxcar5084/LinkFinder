@@ -24,7 +24,7 @@ class APIProvider(Enum):
     ELECTRS = "electrs"
 
 # Configuration
-DEFAULT_API = "electrumx"  # Default to ElectrumX
+DEFAULT_API = "mempool"  # Default to ElectrumX
 
 BLOCKCHAIR_API_URL = "https://api.blockchair.com/bitcoin"
 BLOCKCHAIN_API_URL = "https://blockchain.info"
@@ -56,6 +56,9 @@ SKIP_DISTRIBUTION_MIN_OUTPUTS = 100       # Min outputs to trigger filter
 
 MAX_TRANSACTIONS_PER_ADDRESS = 50
 MAX_DEPTH = 10
+
+# Exchange wallet detection
+EXCHANGE_WALLET_THRESHOLD = 1000  # Addresses with more than this many transactions are considered exchange wallets
 
 # Cache management
 CACHE_MAX_SIZE_MB = 2048           # Maximum cache size in MB
