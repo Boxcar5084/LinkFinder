@@ -145,6 +145,76 @@ def cancel_session(session_id):
         st.error(f"Error: {e}")
     return False
 
+def cancel_all_running_sessions():
+    """Cancel all running sessions (kill switch)"""
+    sessions = get_sessions()
+    running_sessions = [s for s in sessions if s.get('status') == 'running']
+    
+    if not running_sessions:
+        st.info("No running sessions to cancel.")
+        return 0
+    
+    cancelled_count = 0
+    errors = []
+    
+    for session in running_sessions:
+        session_id = session['session_id']
+        try:
+            response = requests.post(f"{API_URL}/cancel/{session_id}", timeout=API_TIMEOUT)
+            if response.status_code == 200:
+                cancelled_count += 1
+            else:
+                errors.append(f"Session {session_id[:12]}...: Status {response.status_code}")
+        except Exception as e:
+            errors.append(f"Session {session_id[:12]}...: {str(e)}")
+    
+    if cancelled_count > 0:
+        st.success(f"✅ Cancelled {cancelled_count} running session(s).")
+    
+    if errors:
+        for error in errors:
+            st.error(error)
+    
+    return cancelled_count
+
+def force_checkpoint_all_running_sessions():
+    """Force create checkpoints for all running sessions"""
+    sessions = get_sessions()
+    running_sessions = [s for s in sessions if s.get('status') == 'running']
+    
+    if not running_sessions:
+        st.info("No running sessions to checkpoint.")
+        return 0
+    
+    checkpointed_count = 0
+    errors = []
+    
+    for session in running_sessions:
+        session_id = session['session_id']
+        try:
+            response = requests.post(f"{API_URL}/checkpoint/{session_id}/force", timeout=API_TIMEOUT)
+            if response.status_code == 200:
+                result = response.json()
+                checkpointed_count += 1
+                checkpoint_id = result.get('checkpoint_id', 'N/A')
+                progress = result.get('progress', {})
+                addresses = progress.get('addresses_examined', 0)
+                st.success(f"✅ Checkpoint created for session {session_id[:12]}... (ID: {checkpoint_id[:12]}..., {addresses} addresses)")
+            else:
+                error_msg = response.json().get('message', f"Status {response.status_code}")
+                errors.append(f"Session {session_id[:12]}...: {error_msg}")
+        except Exception as e:
+            errors.append(f"Session {session_id[:12]}...: {str(e)}")
+    
+    if checkpointed_count > 0:
+        st.success(f"✅ Created checkpoints for {checkpointed_count} running session(s).")
+    
+    if errors:
+        for error in errors:
+            st.error(error)
+    
+    return checkpointed_count
+
 def resume_auto():
     """Auto-resume from most recent checkpoint"""
     try:
@@ -465,6 +535,18 @@ with st.sidebar:
                     st.error(f"Status {response.status_code}")
             except Exception as e:
                 st.error(f"Error: {e}")
+        
+        st.divider()
+        
+        if st.button("Force Checkpoint All Running Sessions", key="force_checkpoint", width='stretch', type="secondary"):
+            checkpointed = force_checkpoint_all_running_sessions()
+            if checkpointed > 0:
+                st.rerun()
+        
+        if st.button("Cancel All Running Sessions", key="kill_switch", width='stretch', type="primary"):
+            cancelled = cancel_all_running_sessions()
+            if cancelled > 0:
+                st.rerun()
 
 # Main tabs
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Active Sessions", "New Trace", "Checkpoints", "Found Connections", "Settings"])
@@ -2054,6 +2136,106 @@ You can still save these settings, but the server may not be accessible when usi
         else:
             st.success("✅ No export files eligible for deletion")
             st.caption("All export files either have connections or are part of active sessions")
+        
+        st.divider()
+        
+        # Checkpoint Management
+        st.subheader("Checkpoint Management")
+        st.markdown("Delete all but the most recent checkpoint for each session")
+        
+        def get_checkpoints_to_delete():
+            """Get list of checkpoints that can be deleted (all but most recent for each session)"""
+            try:
+                # Get all checkpoints
+                checkpoints = get_checkpoints()
+                if not checkpoints:
+                    return []
+                
+                # Group checkpoints by session_id
+                checkpoints_by_session = {}
+                for cp in checkpoints:
+                    session_id = cp['session_id']
+                    if session_id not in checkpoints_by_session:
+                        checkpoints_by_session[session_id] = []
+                    checkpoints_by_session[session_id].append(cp)
+                
+                # For each session, keep only the most recent (first in sorted list)
+                # and mark the rest for deletion
+                checkpoints_to_delete = []
+                for session_id, session_checkpoints in checkpoints_by_session.items():
+                    # Sort by timestamp, most recent first
+                    session_checkpoints.sort(key=lambda x: x['timestamp'], reverse=True)
+                    
+                    # Keep the first one (most recent), mark the rest for deletion
+                    if len(session_checkpoints) > 1:
+                        for checkpoint in session_checkpoints[1:]:
+                            checkpoints_to_delete.append({
+                                'session_id': checkpoint['session_id'],
+                                'checkpoint_id': checkpoint['checkpoint_id'],
+                                'timestamp': checkpoint['timestamp']
+                            })
+                
+                return checkpoints_to_delete
+            except Exception as e:
+                st.error(f"Error getting checkpoints: {e}")
+                return []
+        
+        def cleanup_old_checkpoints():
+            """Call API to cleanup old checkpoints"""
+            try:
+                response = requests.post(f"{API_URL}/checkpoints/cleanup", timeout=API_TIMEOUT)
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    return {'deleted_count': 0, 'errors': [f"API error: {response.status_code}"]}
+            except Exception as e:
+                return {'deleted_count': 0, 'errors': [f"Error: {e}"]}
+        
+        # Get checkpoints eligible for deletion
+        checkpoints_to_delete = get_checkpoints_to_delete()
+        
+        if checkpoints_to_delete:
+            st.info(f"Found {len(checkpoints_to_delete)} checkpoint(s) eligible for deletion")
+            
+            # Show list of checkpoints to be deleted
+            with st.expander("View checkpoints to be deleted", expanded=False):
+                for cp_info in checkpoints_to_delete:
+                    st.write(f"- Session: `{cp_info['session_id'][:12]}...` | Checkpoint: `{cp_info['checkpoint_id'][:12]}...` | Timestamp: {cp_info['timestamp']}")
+            
+            # Delete button with confirmation
+            if 'confirm_delete_checkpoints' not in st.session_state:
+                st.session_state.confirm_delete_checkpoints = False
+            
+            if not st.session_state.confirm_delete_checkpoints:
+                if st.button("Delete Old Checkpoints", width='stretch', type="secondary"):
+                    st.session_state.confirm_delete_checkpoints = True
+                    st.rerun()
+            else:
+                st.warning(f"⚠️ **Confirm Deletion**")
+                st.write(f"This will delete {len(checkpoints_to_delete)} checkpoint(s), keeping only the most recent checkpoint for each session.")
+                st.write("**Checkpoints to be deleted:**")
+                for cp_info in checkpoints_to_delete:
+                    st.write(f"- Session: `{cp_info['session_id'][:12]}...` | Checkpoint: `{cp_info['checkpoint_id'][:12]}...`")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("Confirm Delete", width='stretch', type="primary"):
+                        result = cleanup_old_checkpoints()
+                        if result.get('errors'):
+                            for error in result['errors']:
+                                st.error(error)
+                        if result.get('deleted_count', 0) > 0:
+                            st.success(f"✅ Deleted {result['deleted_count']} checkpoint(s)")
+                            st.session_state.confirm_delete_checkpoints = False
+                            time.sleep(1)
+                            st.rerun()
+                with col2:
+                    if st.button("Cancel", width='stretch', type="secondary"):
+                        st.session_state.confirm_delete_checkpoints = False
+                        st.rerun()
+        else:
+            st.success("✅ No checkpoints eligible for deletion")
+            st.caption("Each session has only one checkpoint (or no checkpoints)")
     else:
         st.error("Could not load settings. Make sure the API server is running.")
         if st.button("Retry", width='stretch'):

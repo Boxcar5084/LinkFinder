@@ -246,3 +246,62 @@ class CheckpointManager:
             print(f"[DEL] Cleaned up {deleted_count} checkpoints for session {session_id}")
 
         return deleted_count
+
+    def get_old_checkpoints(self) -> List[Dict[str, Any]]:
+        """
+        Get list of checkpoints that can be deleted (all but the most recent for each session).
+        Returns list of checkpoint info dicts with session_id, checkpoint_id, and timestamp.
+        """
+        old_checkpoints = []
+        
+        # Get all unique session IDs from checkpoint files
+        checkpoint_files = list(self.checkpoint_dir.glob("*.pkl"))
+        session_ids = set()
+        
+        for f in checkpoint_files:
+            session_id = f.stem.split('_')[0]
+            session_ids.add(session_id)
+        
+        # For each session, get all checkpoints and keep only the most recent
+        for session_id in session_ids:
+            checkpoints = self.list_checkpoints(session_id)
+            
+            # list_checkpoints returns checkpoints sorted by timestamp, most recent first
+            # Keep the first one (most recent), mark the rest for deletion
+            if len(checkpoints) > 1:
+                for checkpoint in checkpoints[1:]:  # Skip the first (most recent)
+                    old_checkpoints.append({
+                        'session_id': checkpoint['session_id'],
+                        'checkpoint_id': checkpoint['checkpoint_id'],
+                        'timestamp': checkpoint['timestamp']
+                    })
+        
+        return old_checkpoints
+
+    def cleanup_old_checkpoints(self) -> Tuple[int, List[str]]:
+        """
+        Delete all but the most recent checkpoint for each session.
+        Returns:
+            Tuple of (deleted_count, errors) where errors is a list of error messages
+        """
+        old_checkpoints = self.get_old_checkpoints()
+        deleted_count = 0
+        errors = []
+        
+        for checkpoint_info in old_checkpoints:
+            success = self.delete_checkpoint(
+                checkpoint_info['session_id'],
+                checkpoint_info['checkpoint_id']
+            )
+            if success:
+                deleted_count += 1
+            else:
+                errors.append(
+                    f"Failed to delete checkpoint {checkpoint_info['checkpoint_id']} "
+                    f"for session {checkpoint_info['session_id'][:12]}..."
+                )
+        
+        if deleted_count > 0:
+            print(f"[DEL] Cleaned up {deleted_count} old checkpoint(s), keeping most recent for each session")
+        
+        return deleted_count, errors

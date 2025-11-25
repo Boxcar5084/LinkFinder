@@ -587,6 +587,70 @@ async def cancel_trace(session_id: str):
     }
 
 
+@app.post("/checkpoint/{session_id}/force")
+async def force_checkpoint(session_id: str):
+    """Force create a checkpoint for a running session"""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+
+    # Only allow checkpointing for running sessions
+    if session['status'] != 'running':
+        return {
+            'session_id': session_id,
+            'message': f"Cannot create checkpoint for session with status: {session['status']}"
+        }
+
+    # Get current trace state from session
+    trace_state = session.get('trace_state', {})
+    
+    # Explicitly extract all fields to ensure complete state saving
+    visited_forward = trace_state.get('visited_forward', {})
+    visited_backward = trace_state.get('visited_backward', {})
+    visited = trace_state.get('visited', set())
+    queued_forward = trace_state.get('queued_forward', [])
+    queued_backward = trace_state.get('queued_backward', [])
+    connections_found = trace_state.get('connections_found', [])
+    search_depth = trace_state.get('search_depth', 0)
+    status = trace_state.get('status', 'searching')
+    
+    # Build checkpoint data with all required fields
+    checkpoint_data = {
+        'session_id': session_id,
+        'request': session.get('request'),
+        'trace_state': {
+            'visited_forward': visited_forward,
+            'visited_backward': visited_backward,
+            'visited': list(visited) if isinstance(visited, set) else visited,
+            'queued_forward': queued_forward,
+            'queued_backward': queued_backward,
+            'connections_found': connections_found,
+            'search_depth': search_depth,
+            'status': status
+        },
+        'periodic_checkpoint': False,  # Mark as manual checkpoint
+        'checkpoint_time': datetime.now().isoformat(),
+        'progress': {
+            'addresses_examined': len(visited) if isinstance(visited, set) else len(visited) if isinstance(visited, list) else 0,
+            'visited_forward': len(visited_forward),
+            'visited_backward': len(visited_backward),
+            'connections_found': len(connections_found),
+        }
+    }
+    
+    # Save checkpoint
+    checkpoint_id = checkpoint_manager.create_checkpoint(session_id, checkpoint_data)
+    session['last_checkpoint_time'] = datetime.now()
+    
+    return {
+        'session_id': session_id,
+        'checkpoint_id': checkpoint_id,
+        'message': 'Checkpoint created successfully',
+        'progress': checkpoint_data['progress']
+    }
+
+
 @app.post("/resume/{session_id}/{checkpoint_id}")
 async def resume_trace(session_id: str, checkpoint_id: str):
     """Resume a cancelled trace from checkpoint"""
@@ -969,6 +1033,21 @@ async def delete_checkpoint(session_id: str, checkpoint_id: str):
         'checkpoint_id': checkpoint_id,
         'message': 'Checkpoint deleted successfully'
     }
+
+
+@app.post("/checkpoints/cleanup")
+async def cleanup_old_checkpoints():
+    """Delete all but the most recent checkpoint for each session"""
+    try:
+        deleted_count, errors = checkpoint_manager.cleanup_old_checkpoints()
+        
+        return {
+            'deleted_count': deleted_count,
+            'errors': errors,
+            'message': f'Cleaned up {deleted_count} old checkpoint(s), keeping most recent for each session'
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error cleaning up checkpoints: {str(e)}")
 
 
 @app.post("/cleanup/{session_id}")
