@@ -2,6 +2,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+from contextlib import asynccontextmanager
 import uuid
 import asyncio
 import sqlite3
@@ -11,9 +12,8 @@ from graph_engine import BitcoinAddressLinker
 from cache_manager import TransactionCache
 from checkpoint_manager import CheckpointManager
 from export_manager import ExportManager
-from config import DEFAULT_API
-
-app = FastAPI(title="Bitcoin Address Linker")
+from config import DEFAULT_API, MEMPOOL_API_KEY
+from pathlib import Path
 
 # Global state
 print("[MAIN] Initializing global services...")
@@ -24,20 +24,25 @@ export_manager = ExportManager()
 sessions = {}  # session_id -> {status, task, results, checkpoint_id, ...}
 print("[MAIN] Global services initialized")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    yield
+    # Shutdown
+    cache_manager.close()
+    # Cancel all running tasks and save checkpoints
+    for session_id, session in sessions.items():
+        if session['status'] == 'running' and session.get('task'):
+            session['task'].cancel()
+
+app = FastAPI(title="Bitcoin Address Linker", lifespan=lifespan)
+
 class TraceRequest(BaseModel):
     list_a: List[str]
     list_b: List[str]
     max_depth: int = 5
     start_block: Optional[int] = None
     end_block: Optional[int] = None
-
-@app.on_event("shutdown")
-async def shutdown():
-    cache_manager.close()
-    # Cancel all running tasks and save checkpoints
-    for session_id, session in sessions.items():
-        if session['status'] == 'running' and session.get('task'):
-            session['task'].cancel()
 
 @app.post("/trace")
 async def start_trace(request: TraceRequest):
@@ -1008,6 +1013,151 @@ async def test_cache():
         "cache_working": cached_after == test_txs,
         "stats": cache_manager.get_cache_stats()
     }
+
+
+# ========== SETTINGS ENDPOINTS ==========
+
+class SettingsUpdate(BaseModel):
+    default_api: Optional[str] = None
+    mempool_api_key: Optional[str] = None
+    electrumx_host: Optional[str] = None
+    electrumx_port: Optional[int] = None
+    electrumx_use_ssl: Optional[str] = None
+    electrumx_cert: Optional[str] = None
+
+
+def _read_env_file() -> Dict[str, str]:
+    """Read current .env file contents"""
+    env_path = Path(".env")
+    env_vars = {}
+    if env_path.exists():
+        with open(env_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, value = line.split('=', 1)
+                    env_vars[key.strip()] = value.strip()
+    return env_vars
+
+
+def _write_env_file(env_vars: Dict[str, str]):
+    """Write .env file with updated values"""
+    env_path = Path(".env")
+    
+    # Read existing file to preserve comments and order
+    lines = []
+    existing_keys = set()
+    
+    if env_path.exists():
+        with open(env_path, 'r') as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped and not stripped.startswith('#') and '=' in stripped:
+                    key = stripped.split('=', 1)[0].strip()
+                    existing_keys.add(key)
+                    if key in env_vars:
+                        lines.append(f"{key}={env_vars[key]}\n")
+                    else:
+                        lines.append(line)
+                else:
+                    lines.append(line)
+    
+    # Add any new keys that weren't in the file
+    for key, value in env_vars.items():
+        if key not in existing_keys:
+            lines.append(f"{key}={value}\n")
+    
+    # Write the file
+    with open(env_path, 'w') as f:
+        f.writelines(lines)
+
+
+@app.get("/settings")
+async def get_settings():
+    """Get current application settings"""
+    import os
+    
+    # Re-read from environment to get current values
+    env_vars = _read_env_file()
+    
+    return {
+        'default_api': env_vars.get('DEFAULT_API', DEFAULT_API),
+        'mempool_api_key': env_vars.get('MEMPOOL_API_KEY', ''),
+        'mempool_api_key_set': bool(env_vars.get('MEMPOOL_API_KEY', '')),
+        'electrumx_host': env_vars.get('ELECTRUMX_HOST', ''),
+        'electrumx_port': env_vars.get('ELECTRUMX_PORT', ''),
+        'electrumx_use_ssl': env_vars.get('ELECTRUMX_USE_SSL', ''),
+        'electrumx_cert': env_vars.get('ELECTRUMX_CERT', ''),
+        'available_providers': ['mempool', 'blockchain', 'electrumx']
+    }
+
+
+@app.post("/settings")
+async def update_settings(settings: SettingsUpdate):
+    """Update application settings and persist to .env file"""
+    import os
+    
+    # Read current env vars
+    env_vars = _read_env_file()
+    
+    updated = []
+    
+    # Update DEFAULT_API if provided
+    if settings.default_api is not None:
+        valid_providers = ['mempool', 'blockchain', 'electrumx']
+        if settings.default_api.lower() not in valid_providers:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid provider. Must be one of: {', '.join(valid_providers)}"
+            )
+        env_vars['DEFAULT_API'] = settings.default_api.lower()
+        os.environ['DEFAULT_API'] = settings.default_api.lower()
+        updated.append('default_api')
+    
+    # Update MEMPOOL_API_KEY if provided
+    if settings.mempool_api_key is not None:
+        env_vars['MEMPOOL_API_KEY'] = settings.mempool_api_key
+        os.environ['MEMPOOL_API_KEY'] = settings.mempool_api_key
+        updated.append('mempool_api_key')
+    
+    # Update ElectrumX settings if provided
+    if settings.electrumx_host is not None:
+        env_vars['ELECTRUMX_HOST'] = settings.electrumx_host
+        os.environ['ELECTRUMX_HOST'] = settings.electrumx_host
+        updated.append('electrumx_host')
+    
+    if settings.electrumx_port is not None:
+        env_vars['ELECTRUMX_PORT'] = str(settings.electrumx_port)
+        os.environ['ELECTRUMX_PORT'] = str(settings.electrumx_port)
+        updated.append('electrumx_port')
+    
+    if settings.electrumx_use_ssl is not None:
+        env_vars['ELECTRUMX_USE_SSL'] = settings.electrumx_use_ssl.lower()
+        os.environ['ELECTRUMX_USE_SSL'] = settings.electrumx_use_ssl.lower()
+        updated.append('electrumx_use_ssl')
+    
+    if settings.electrumx_cert is not None:
+        env_vars['ELECTRUMX_CERT'] = settings.electrumx_cert
+        os.environ['ELECTRUMX_CERT'] = settings.electrumx_cert
+        updated.append('electrumx_cert')
+    
+    # Write to .env file
+    _write_env_file(env_vars)
+    
+    # Reload config module to pick up new values
+    import importlib
+    import config
+    importlib.reload(config)
+    
+    return {
+        'message': 'Settings updated successfully',
+        'updated_fields': updated,
+        'current_settings': {
+            'default_api': env_vars.get('DEFAULT_API', 'mempool'),
+            'mempool_api_key_set': bool(env_vars.get('MEMPOOL_API_KEY', ''))
+        }
+    }
+
 
 if __name__ == "__main__":
     import uvicorn

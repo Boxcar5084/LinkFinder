@@ -5,7 +5,7 @@ import time
 import hashlib
 from typing import List, Dict, Optional, Any
 from abc import ABC, abstractmethod
-from config import DEFAULT_API
+from config import DEFAULT_API, MEMPOOL_API_KEY
 import socket
 import json
 
@@ -138,9 +138,10 @@ class BlockchainInfoProvider(APIProvider):
 class MempoolProvider(APIProvider):
     """Mempool.space API provider with rate limit retry logic"""
 
-    def __init__(self):
+    def __init__(self, api_key: str = None):
         self.base_url = "https://mempool.space/api"
         self.timeout = 30
+        self.api_key = api_key if api_key else MEMPOOL_API_KEY
 
     async def get_address_transactions(self, address: str,
                                      start_block: Optional[int] = None,
@@ -156,9 +157,13 @@ class MempoolProvider(APIProvider):
             try:
                 await asyncio.sleep(0.5)  # Rate limiting delay
 
-                response = requests.get(url, timeout=self.timeout, headers={
+                headers = {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-                })
+                }
+                if self.api_key:
+                    headers['X-Mempool-Key'] = self.api_key
+
+                response = requests.get(url, timeout=self.timeout, headers=headers)
 
                 # Check for rate limit (429)
                 if response.status_code == 429:
@@ -760,12 +765,13 @@ class ElectrumXProvider(APIProvider):
         pass
 
 
-def get_provider(provider_name: str = None) -> APIProvider:
+def get_provider(provider_name: str = None, api_key: str = None) -> APIProvider:
     """
     Factory function to get the appropriate API provider
     
     Args:
         provider_name: "blockchain", "mempool", "electrumx", or None (uses DEFAULT_API from config)
+        api_key: Optional API key (currently only used for Mempool.space)
     
     Returns:
         APIProvider instance
@@ -781,7 +787,7 @@ def get_provider(provider_name: str = None) -> APIProvider:
 
     elif provider_name == "mempool":
         print("[API] Using Mempool.space API")
-        return MempoolProvider()
+        return MempoolProvider(api_key=api_key)
 
     elif provider_name == "electrumx":
         print("[API] Using ElectrumX Node")

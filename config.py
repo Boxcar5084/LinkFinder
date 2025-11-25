@@ -4,6 +4,13 @@ import os
 from pathlib import Path
 from enum import Enum
 
+# Load .env file if it exists (for persistent settings)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+except ImportError:
+    pass  # python-dotenv not installed, use environment variables only
+
 # Create directories immediately
 Path("checkpoints").mkdir(parents=True, exist_ok=True)
 Path("exports").mkdir(parents=True, exist_ok=True)
@@ -24,11 +31,14 @@ class APIProvider(Enum):
     ELECTRS = "electrs"
 
 # Configuration
-DEFAULT_API = "mempool"  # Default to ElectrumX
+DEFAULT_API = os.getenv("DEFAULT_API", "mempool")
 
 BLOCKCHAIR_API_URL = "https://api.blockchair.com/bitcoin"
 BLOCKCHAIN_API_URL = "https://blockchain.info"
 MEMPOOL_API_URL = "https://mempool.space/api"
+
+# API Keys
+MEMPOOL_API_KEY = os.getenv("MEMPOOL_API_KEY", "")
 
 # ElectrumX Configuration (Electrum protocol over TCP/SSL)
 ELECTRUMX_HOST = os.getenv("ELECTRUMX_HOST", "100.94.34.56")
