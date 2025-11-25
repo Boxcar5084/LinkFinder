@@ -334,13 +334,15 @@ class BitcoinAddressLinkerWithCheckpoint:
             
             queued_forward = trace_state.get('queued_forward', [])  # GET QUEUED
             queued_backward = trace_state.get('queued_backward', [])  # GET QUEUED
+            connections_found = trace_state.get('connections_found', [])  # GET EXISTING CONNECTIONS
             
             print(f" Previously visited (forward): {len(visited_forward)} addresses")
             print(f" Previously visited (backward): {len(visited_backward)} addresses")
             print(f" Total visited: {len(visited)} addresses")
+            print(f" Existing connections: {len(connections_found)} connections")
             print(f" Continuing trace...\n")
             
-            # CRITICAL FIX: Pass queued addresses to linker for proper resumption
+            # CRITICAL FIX: Pass queued addresses and existing connections to linker for proper resumption
             result = await self.linker.find_connection_with_visited_state(
                 list_a, 
                 list_b, 
@@ -351,6 +353,7 @@ class BitcoinAddressLinkerWithCheckpoint:
                 visited_backward=visited_backward,
                 queued_forward=queued_forward,     # PASS QUEUED FORWARD
                 queued_backward=queued_backward,   # PASS QUEUED BACKWARD
+                connections_found=connections_found,  # PASS EXISTING CONNECTIONS
                 progress_callback=self._progress_callback,
                 connection_callback=connection_callback
             )
@@ -381,7 +384,8 @@ class BitcoinAddressLinkerWithCheckpoint:
         self.sessions[self.session_id]['progress'] = {
             'addresses_examined': result.get('total_addresses_examined', 0),
             'visited_forward': len(trace_state.get('visited_forward', {})),
-            'visited_backward': len(trace_state.get('visited_backward', {}))
+            'visited_backward': len(trace_state.get('visited_backward', {})),
+            'connections_found': len(trace_state.get('connections_found', []))  # Add connections_found count
         }
 
         return result
@@ -402,6 +406,8 @@ class BitcoinAddressLinkerWithCheckpoint:
             session['trace_state']['visited_backward'] = {}
         if 'visited' not in session['trace_state']:
             session['trace_state']['visited'] = set()
+        if 'connections_found' not in session['trace_state']:
+            session['trace_state']['connections_found'] = []
         
         # Convert to dict if it's a set (backward compatibility)
         if isinstance(session['trace_state']['visited_forward'], set):
@@ -856,6 +862,36 @@ async def get_checkpoint_info(session_id: str):
         'status': session.get('status'),
         'progress': checkpoint_data.get('progress', {}),
         'cancelled_at': checkpoint_data.get('cancelled_at'),
+        'can_resume': True
+    }
+
+
+@app.get("/checkpoint/{session_id}/{checkpoint_id}")
+async def get_checkpoint_details(session_id: str, checkpoint_id: str):
+    """Get detailed checkpoint information including request parameters"""
+    checkpoint = checkpoint_manager.load_checkpoint(session_id, checkpoint_id)
+
+    if not checkpoint:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+
+    checkpoint_data = checkpoint['state']
+    request_data = checkpoint_data.get('request', {})
+    progress = checkpoint_data.get('progress', {})
+    trace_state = checkpoint_data.get('trace_state', {})
+
+    return {
+        'session_id': session_id,
+        'checkpoint_id': checkpoint_id,
+        'timestamp': checkpoint.get('timestamp'),
+        'request': request_data,
+        'progress': progress,
+        'trace_state': {
+            'connections_found_count': len(trace_state.get('connections_found', [])),
+            'visited_forward_count': len(trace_state.get('visited_forward', {})),
+            'visited_backward_count': len(trace_state.get('visited_backward', {}))
+        },
+        'cancelled_at': checkpoint_data.get('cancelled_at'),
+        'periodic_checkpoint': checkpoint_data.get('periodic_checkpoint', False),
         'can_resume': True
     }
 

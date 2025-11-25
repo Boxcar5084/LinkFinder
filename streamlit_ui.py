@@ -149,6 +149,32 @@ def delete_checkpoint(session_id, checkpoint_id):
         st.error(f"Error: {e}")
     return False
 
+def get_checkpoint_details(session_id, checkpoint_id):
+    """Get detailed checkpoint information"""
+    try:
+        response = requests.get(f"{API_URL}/checkpoint/{session_id}/{checkpoint_id}", timeout=API_TIMEOUT)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            st.error(f"Failed to get checkpoint details: {response.text}")
+    except Exception as e:
+        st.error(f"Error: {e}")
+    return None
+
+def resume_from_checkpoint(session_id, checkpoint_id):
+    """Resume from a specific checkpoint"""
+    try:
+        response = requests.post(f"{API_URL}/resume/{session_id}/{checkpoint_id}", timeout=API_TIMEOUT)
+        if response.status_code == 200:
+            result = response.json()
+            st.success(f"Resumed! New session: {result['session_id'][:8]}...")
+            return result
+        else:
+            st.error(f"Failed to resume: {response.text}")
+    except Exception as e:
+        st.error(f"Error: {e}")
+    return None
+
 def get_status_badge(status):
     """Return status badge"""
     badges = {
@@ -355,13 +381,37 @@ with tab1:
                     
                     progress = details.get('progress', {})
                     if progress:
-                        col1, col2, col3 = st.columns(3)
+                        col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             st.metric("Addresses Examined", progress.get('addresses_examined', 0))
                         with col2:
                             st.metric("Forward", progress.get('visited_forward', 0))
                         with col3:
                             st.metric("Backward", progress.get('visited_backward', 0))
+                        with col4:
+                            st.metric("Connections Found", progress.get('connections_found', 0))
+                    
+                    # Display connections if available
+                    trace_state = details.get('trace_state', {})
+                    connections_found = trace_state.get('connections_found', [])
+                    if connections_found:
+                        with st.expander(f"View {len(connections_found)} Connection(s)", expanded=False):
+                            for idx, conn in enumerate(connections_found, 1):
+                                st.write(f"**Connection {idx}:**")
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.write(f"**Source:** `{conn.get('source', 'N/A')}`")
+                                    st.write(f"**Target:** `{conn.get('target', 'N/A')}`")
+                                    st.write(f"**Path Length:** {conn.get('path_count', 'N/A')}")
+                                    st.write(f"**Found at Depth:** {conn.get('found_at_depth', 'N/A')}")
+                                with col2:
+                                    path = conn.get('path', [])
+                                    if path:
+                                        st.write("**Path:**")
+                                        path_str = ' → '.join(path)
+                                        st.code(path_str, language=None)
+                                if idx < len(connections_found):
+                                    st.divider()
                     
                     st.divider()
                     
@@ -502,22 +552,184 @@ with tab3:
         
         st.subheader(f"All Checkpoints ({len(checkpoints)})")
         
-        # Display checkpoints with delete buttons
+        # Display checkpoints with details and actions
         for idx, cp in enumerate(checkpoints[:20]):
-            col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 2, 1])
+            # Get checkpoint details
+            cp_details = get_checkpoint_details(cp['session_id'], cp['checkpoint_id'])
             
-            with col1:
-                st.write(f"**{cp['timestamp'][:19]}**")
-            with col2:
-                st.write(cp['session_id'][:12] + "...")
-            with col3:
-                st.write(cp['session_status'].upper())
-            with col4:
-                st.write(cp['checkpoint_id'][:12] + "...")
-            with col5:
-                if st.button("🗑️", key=f"delete_cp_{idx}_{cp['checkpoint_id']}", help="Delete checkpoint"):
-                    if delete_checkpoint(cp['session_id'], cp['checkpoint_id']):
-                        st.rerun()
+            with st.expander(
+                f"**{cp['timestamp'][:19]}** | Session: {cp['session_id'][:12]}... | Status: {cp['session_status'].upper()}",
+                expanded=False
+            ):
+                # Basic info
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.write(f"**Session ID**")
+                    st.code(cp['session_id'][:20] + "...")
+                with col2:
+                    st.write(f"**Checkpoint ID**")
+                    st.code(cp['checkpoint_id'][:20] + "...")
+                with col3:
+                    st.write(f"**Status**")
+                    st.write(cp['session_status'].upper())
+                with col4:
+                    st.write(f"**Timestamp**")
+                    st.write(cp['timestamp'][:19])
+                
+                if cp_details:
+                    # Progress metrics
+                    progress = cp_details.get('progress', {})
+                    if progress:
+                        st.divider()
+                        st.write("**Progress**")
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Addresses Examined", progress.get('addresses_examined', 0))
+                        with col2:
+                            st.metric("Forward", progress.get('visited_forward', 0))
+                        with col3:
+                            st.metric("Backward", progress.get('visited_backward', 0))
+                        with col4:
+                            st.metric("Connections", progress.get('connections_found', 0))
+                    
+                    # Load full checkpoint data to get connections
+                    cp_full_data = load_checkpoint_data(cp['session_id'], cp['checkpoint_id'])
+                    connections_found = []
+                    if cp_full_data:
+                        trace_state = cp_full_data.get('state', {}).get('trace_state', {})
+                        connections_found = trace_state.get('connections_found', [])
+                    
+                    # Display connections found
+                    if connections_found:
+                        st.divider()
+                        st.write(f"**Connections Found ({len(connections_found)})**")
+                        
+                        # Track which connection path to show using session state
+                        path_display_key = f"show_path_{idx}_{cp['checkpoint_id']}"
+                        
+                        for conn_idx, conn in enumerate(connections_found):
+                            source = conn.get('source', 'N/A')
+                            target = conn.get('target', 'N/A')
+                            path = conn.get('path', [])
+                            path_length = conn.get('path_count', len(path))
+                            
+                            # Create a clickable connection display
+                            col1, col2, col3 = st.columns([3, 1, 1])
+                            with col1:
+                                st.write(f"**{conn_idx + 1}.** `{source[:20]}...` → `{target[:20]}...`")
+                            with col2:
+                                st.caption(f"Path: {path_length} hops")
+                            with col3:
+                                # Button to show full path
+                                button_key = f"show_path_btn_{idx}_{cp['checkpoint_id']}_{conn_idx}"
+                                if st.button("View Path", key=button_key, use_container_width=True):
+                                    if path:
+                                        # Store which connection to show in session state
+                                        st.session_state[path_display_key] = conn_idx
+                                        
+                                        # Show toast notification
+                                        try:
+                                            toast_msg = f"Showing path: {source[:12]}... → {target[:12]}... ({path_length} hops)"
+                                            st.toast(toast_msg, icon="🔗")
+                                        except (AttributeError, TypeError):
+                                            # Fallback: toast not available
+                                            pass
+                                        st.rerun()
+                        
+                        # Display the selected path if one was clicked
+                        if path_display_key in st.session_state:
+                            selected_idx = st.session_state[path_display_key]
+                            if selected_idx < len(connections_found):
+                                selected_conn = connections_found[selected_idx]
+                                selected_source = selected_conn.get('source', 'N/A')
+                                selected_target = selected_conn.get('target', 'N/A')
+                                selected_path = selected_conn.get('path', [])
+                                selected_length = selected_conn.get('path_count', len(selected_path))
+                                
+                                st.divider()
+                                st.markdown("### 🔗 Connection Path Details")
+                                
+                                col_a, col_b = st.columns(2)
+                                with col_a:
+                                    st.markdown(f"**From:**\n`{selected_source}`")
+                                with col_b:
+                                    st.markdown(f"**To:**\n`{selected_target}`")
+                                
+                                st.markdown(f"**Path Length:** {selected_length} hops")
+                                st.markdown("**Full Path:**")
+                                
+                                # Display path with better formatting - each address on its own line with arrows
+                                path_html = ""
+                                for i, addr in enumerate(selected_path):
+                                    if i < len(selected_path) - 1:
+                                        path_html += f"`{addr}` → "
+                                    else:
+                                        path_html += f"`{addr}`"
+                                
+                                st.markdown(path_html)
+                                
+                                # Button to close/hide the path
+                                if st.button("Close", key=f"close_path_{idx}_{cp['checkpoint_id']}"):
+                                    if path_display_key in st.session_state:
+                                        del st.session_state[path_display_key]
+                                    st.rerun()
+                                
+                                st.divider()
+                    
+                    # Request parameters (list_a and list_b)
+                    request_data = cp_details.get('request', {})
+                    if request_data:
+                        st.divider()
+                        st.write("**Request Parameters**")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            list_a = request_data.get('list_a', [])
+                            st.write(f"**List A ({len(list_a)} addresses)**")
+                            if list_a:
+                                for addr in list_a[:10]:  # Show first 10
+                                    st.code(addr)
+                                if len(list_a) > 10:
+                                    st.caption(f"... and {len(list_a) - 10} more")
+                            else:
+                                st.info("No addresses")
+                        
+                        with col2:
+                            list_b = request_data.get('list_b', [])
+                            st.write(f"**List B ({len(list_b)} addresses)**")
+                            if list_b:
+                                for addr in list_b[:10]:  # Show first 10
+                                    st.code(addr)
+                                if len(list_b) > 10:
+                                    st.caption(f"... and {len(list_b) - 10} more")
+                            else:
+                                st.info("No addresses")
+                        
+                        # Additional request parameters
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Max Depth", request_data.get('max_depth', 'N/A'))
+                        with col2:
+                            start_block = request_data.get('start_block')
+                            st.metric("Start Block", start_block if start_block else "None")
+                        with col3:
+                            end_block = request_data.get('end_block')
+                            st.metric("End Block", end_block if end_block else "None")
+                
+                # Action buttons
+                st.divider()
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    if st.button("Resume from this Checkpoint", key=f"resume_cp_{idx}_{cp['checkpoint_id']}", use_container_width=True, type="primary"):
+                        with st.spinner("Resuming..."):
+                            result = resume_from_checkpoint(cp['session_id'], cp['checkpoint_id'])
+                            if result:
+                                time.sleep(1)
+                                st.rerun()
+                with col2:
+                    if st.button("🗑️ Delete", key=f"delete_cp_{idx}_{cp['checkpoint_id']}", use_container_width=True, type="secondary"):
+                        if delete_checkpoint(cp['session_id'], cp['checkpoint_id']):
+                            st.rerun()
             
             if idx < len(checkpoints[:20]) - 1:
                 st.divider()

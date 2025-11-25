@@ -276,6 +276,7 @@ class BitcoinAddressLinker:
                                                 visited_backward: Union[Dict, Set, List] = None,
                                                 queued_forward: Union[List] = None,
                                                 queued_backward: Union[List] = None,
+                                                connections_found: Optional[List] = None,
                                                 progress_callback=None,
                                                 connection_callback=None) -> Dict[str, Any]:
         """Resume from checkpoint with proper queue reconstruction"""
@@ -299,8 +300,17 @@ class BitcoinAddressLinker:
         else:
             visited_backward_dict = {addr: [addr] for addr in list_b}
 
+        # Initialize with existing connections from checkpoint if provided
+        existing_connections = connections_found if connections_found is not None else []
+        # Track existing connection keys to avoid duplicates (use source+target as key)
+        existing_connection_keys = set()
+        for conn in existing_connections:
+            if isinstance(conn, dict):
+                key = (conn.get('source'), conn.get('target'))
+                existing_connection_keys.add(key)
+
         results = {
-            'connections_found': [],
+            'connections_found': existing_connections.copy() if existing_connections else [],
             'search_depth': max_depth,
             'total_addresses_examined': 0,
             'block_range': (start_block, end_block),
@@ -460,8 +470,13 @@ class BitcoinAddressLinker:
                                     'direction': 'forward_meets_backward'
                                 }
                                 
-                                # Add connection to results
-                                results['connections_found'].append(connection)
+                                # Check for duplicates before adding
+                                connection_key = (connection['source'], connection['target'])
+                                if connection_key not in existing_connection_keys:
+                                    results['connections_found'].append(connection)
+                                    existing_connection_keys.add(connection_key)
+                                else:
+                                    print(f"  [SKIP] Duplicate connection: {connection['source']} -> {connection['target']}")
                                 
                                 # Mark this target as matched
                                 matched_targets.add(target_addr)
@@ -569,8 +584,13 @@ class BitcoinAddressLinker:
                                     'direction': 'backward_meets_forward'
                                 }
                                 
-                                # Add connection to results
-                                results['connections_found'].append(connection)
+                                # Check for duplicates before adding
+                                connection_key = (connection['source'], connection['target'])
+                                if connection_key not in existing_connection_keys:
+                                    results['connections_found'].append(connection)
+                                    existing_connection_keys.add(connection_key)
+                                else:
+                                    print(f"  [SKIP] Duplicate connection: {connection['source']} -> {connection['target']}")
                                 
                                 # Mark this target as matched
                                 matched_targets.add(target_addr)
