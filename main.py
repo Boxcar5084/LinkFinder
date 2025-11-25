@@ -150,15 +150,36 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
         
         # Save current trace state as checkpoint
         trace_state = sessions[session_id].get('trace_state', {})
+        
+        # Explicitly extract all fields to ensure complete state saving
+        visited_forward = trace_state.get('visited_forward', {})
+        visited_backward = trace_state.get('visited_backward', {})
+        visited = trace_state.get('visited', set())
+        queued_forward = trace_state.get('queued_forward', [])
+        queued_backward = trace_state.get('queued_backward', [])
+        connections_found = trace_state.get('connections_found', [])
+        search_depth = trace_state.get('search_depth', 0)
+        status = trace_state.get('status', 'cancelled')
+        
         checkpoint_data = {
             'session_id': session_id,
             'request': sessions[session_id].get('request'),
-            'trace_state': trace_state,
+            'trace_state': {
+                'visited_forward': visited_forward,
+                'visited_backward': visited_backward,
+                'visited': list(visited) if isinstance(visited, set) else visited,  # Convert set to list for saving
+                'queued_forward': queued_forward,
+                'queued_backward': queued_backward,
+                'connections_found': connections_found,  # CRITICAL: Ensure connections_found is saved
+                'search_depth': search_depth,
+                'status': status
+            },
             'cancelled_at': datetime.now().isoformat(),
             'progress': {
-                'addresses_examined': len(trace_state.get('visited', set())),
-                'visited_forward': len(trace_state.get('visited_forward', {})),
-                'visited_backward': len(trace_state.get('visited_backward', {})),
+                'addresses_examined': len(visited) if isinstance(visited, set) else len(visited) if isinstance(visited, list) else 0,
+                'visited_forward': len(visited_forward),
+                'visited_backward': len(visited_backward),
+                'connections_found': len(connections_found),  # Add connections_found count to progress
             }
         }
 
@@ -210,31 +231,37 @@ async def _periodic_checkpoint_task(session_id: str):
             # Get current trace state from session
             trace_state = sessions[session_id].get('trace_state', {})
             
-            # Extract the visited dictionaries (they should have real data now from graph_engine)
+            # Explicitly extract all fields to ensure complete state saving
             visited_forward = trace_state.get('visited_forward', {})
             visited_backward = trace_state.get('visited_backward', {})
             visited = trace_state.get('visited', set())
+            queued_forward = trace_state.get('queued_forward', [])
+            queued_backward = trace_state.get('queued_backward', [])
             connections_found = trace_state.get('connections_found', [])
+            search_depth = trace_state.get('search_depth', 0)
+            status = trace_state.get('status', 'searching')
             
-            # Build checkpoint data
-            # Convert dicts to serializable format (dicts are already serializable, but ensure nested structures are handled)
+            # Build checkpoint data with all required fields
             checkpoint_data = {
                 'session_id': session_id,
                 'request': sessions[session_id].get('request'),
                 'trace_state': {
                     'visited_forward': visited_forward,  # Dict is already serializable
                     'visited_backward': visited_backward,  # Dict is already serializable
-                    'visited': list(visited) if isinstance(visited, set) else visited,  # Convert set to list
-                    'queued_forward': trace_state.get('queued_forward', []),
-                    'queued_backward': trace_state.get('queued_backward', []),
-                    'connections_found': trace_state.get('connections_found', [])
+                    'visited': list(visited) if isinstance(visited, set) else visited,  # Convert set to list for saving
+                    'queued_forward': queued_forward,
+                    'queued_backward': queued_backward,
+                    'connections_found': connections_found,  # CRITICAL: Ensure connections_found is saved
+                    'search_depth': search_depth,
+                    'status': status
                 },
                 'periodic_checkpoint': True,
                 'checkpoint_time': datetime.now().isoformat(),
                 'progress': {
-                    'addresses_examined': len(trace_state.get('visited', set())),
-                    'visited_forward': len(trace_state.get('visited_forward', {})),
-                    'visited_backward': len(trace_state.get('visited_backward', {})),
+                    'addresses_examined': len(visited) if isinstance(visited, set) else len(visited) if isinstance(visited, list) else 0,
+                    'visited_forward': len(visited_forward),
+                    'visited_backward': len(visited_backward),
+                    'connections_found': len(connections_found),  # Add connections_found count to progress
                 }
             }
             
@@ -382,6 +409,10 @@ class BitcoinAddressLinkerWithCheckpoint:
         if isinstance(session['trace_state']['visited_backward'], set):
             session['trace_state']['visited_backward'] = {addr: [addr] for addr in session['trace_state']['visited_backward']}
         
+        # DEFENSIVE FIX: Convert visited from list to set if needed (checkpoint resume issue)
+        if isinstance(session['trace_state']['visited'], list):
+            session['trace_state']['visited'] = set(session['trace_state']['visited'])
+        
         # Add to visited set
         session['trace_state']['visited'].add(current)
         
@@ -417,6 +448,65 @@ async def get_results(session_id: str):
         raise HTTPException(status_code=400, detail="Session not completed")
 
     return session['results']
+
+
+def _normalize_trace_state_from_checkpoint(trace_state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize trace_state loaded from checkpoint to ensure proper data types.
+    Converts visited from list to set and ensures all required fields exist.
+    """
+    normalized = trace_state.copy() if trace_state else {}
+    
+    # Ensure visited is a set (convert from list if needed)
+    visited_raw = normalized.get('visited', set())
+    if isinstance(visited_raw, list):
+        normalized['visited'] = set(visited_raw)
+    elif isinstance(visited_raw, set):
+        normalized['visited'] = visited_raw
+    else:
+        normalized['visited'] = set()
+    
+    # Ensure visited_forward is a dict
+    visited_forward_raw = normalized.get('visited_forward', {})
+    if isinstance(visited_forward_raw, list):
+        normalized['visited_forward'] = {addr: [addr] for addr in visited_forward_raw}
+    elif not isinstance(visited_forward_raw, dict):
+        normalized['visited_forward'] = {}
+    
+    # Ensure visited_backward is a dict
+    visited_backward_raw = normalized.get('visited_backward', {})
+    if isinstance(visited_backward_raw, list):
+        normalized['visited_backward'] = {addr: [addr] for addr in visited_backward_raw}
+    elif not isinstance(visited_backward_raw, dict):
+        normalized['visited_backward'] = {}
+    
+    # Ensure queued_forward is a list
+    if 'queued_forward' not in normalized:
+        normalized['queued_forward'] = []
+    elif not isinstance(normalized['queued_forward'], list):
+        normalized['queued_forward'] = []
+    
+    # Ensure queued_backward is a list
+    if 'queued_backward' not in normalized:
+        normalized['queued_backward'] = []
+    elif not isinstance(normalized['queued_backward'], list):
+        normalized['queued_backward'] = []
+    
+    # Ensure connections_found is a list
+    if 'connections_found' not in normalized:
+        normalized['connections_found'] = []
+    elif not isinstance(normalized['connections_found'], list):
+        normalized['connections_found'] = []
+    
+    # Ensure search_depth exists
+    if 'search_depth' not in normalized:
+        normalized['search_depth'] = 0
+    
+    # Ensure status exists
+    if 'status' not in normalized:
+        normalized['status'] = 'searching'
+    
+    return normalized
 
 
 @app.post("/cancel/{session_id}")
@@ -485,6 +575,9 @@ async def resume_trace(session_id: str, checkpoint_id: str):
 
     # CRITICAL FIX: Store checkpoint state so it gets loaded during tracing
     checkpoint_trace_state = checkpoint_data.get('trace_state', {})
+    # Normalize trace_state to ensure proper data types (list->set conversion)
+    normalized_trace_state = _normalize_trace_state_from_checkpoint(checkpoint_trace_state)
+    
     sessions[new_session_id] = {
         'status': 'running',
         'progress': 0,
@@ -498,8 +591,8 @@ async def resume_trace(session_id: str, checkpoint_id: str):
             'end_block': request.end_block
         },
         'checkpoint_id': checkpoint_id,
-        'trace_state': checkpoint_trace_state,
-        'checkpoint_state': checkpoint_trace_state,  # PASS TO LINKER
+        'trace_state': normalized_trace_state,
+        'checkpoint_state': normalized_trace_state,  # PASS TO LINKER
         'resumed_from_session': session_id,  # Track origin
         'last_checkpoint_time': datetime.now()
     }
@@ -548,6 +641,9 @@ async def auto_resume():
     task = asyncio.create_task(_run_trace_task(new_session_id, request))
 
     # CRITICAL FIX: Store checkpoint state so it gets loaded during tracing
+    # Normalize trace_state to ensure proper data types (list->set conversion)
+    normalized_trace_state = _normalize_trace_state_from_checkpoint(checkpoint_trace_state)
+    
     sessions[new_session_id] = {
         'status': 'running',
         'progress': 0,
@@ -561,8 +657,8 @@ async def auto_resume():
             'end_block': request.end_block
         },
         'checkpoint_id': checkpoint_id,
-        'trace_state': checkpoint_trace_state,
-        'checkpoint_state': checkpoint_trace_state,  # PASS TO LINKER
+        'trace_state': normalized_trace_state,
+        'checkpoint_state': normalized_trace_state,  # PASS TO LINKER
         'resumed_from_session': session_id,
         'auto_resumed': True,
         'last_checkpoint_time': datetime.now()
@@ -617,6 +713,9 @@ async def auto_resume_session(session_id: str):
     task = asyncio.create_task(_run_trace_task(new_session_id, request))
 
     # CRITICAL FIX: Store checkpoint state so it gets loaded during tracing
+    # Normalize trace_state to ensure proper data types (list->set conversion)
+    normalized_trace_state = _normalize_trace_state_from_checkpoint(checkpoint_trace_state)
+    
     sessions[new_session_id] = {
         'status': 'running',
         'progress': 0,
@@ -630,8 +729,8 @@ async def auto_resume_session(session_id: str):
             'end_block': request.end_block
         },
         'checkpoint_id': checkpoint_id,
-        'trace_state': checkpoint_trace_state,
-        'checkpoint_state': checkpoint_trace_state,  # PASS TO LINKER
+        'trace_state': normalized_trace_state,
+        'checkpoint_state': normalized_trace_state,  # PASS TO LINKER
         'resumed_from_session': session_id,
         'auto_resumed': True,
         'last_checkpoint_time': datetime.now()
@@ -776,6 +875,21 @@ async def list_checkpoints(session_id: str):
             for cp in checkpoints
         ],
         'count': len(checkpoints)
+    }
+
+
+@app.delete("/checkpoints/{session_id}/{checkpoint_id}")
+async def delete_checkpoint(session_id: str, checkpoint_id: str):
+    """Delete a specific checkpoint"""
+    success = checkpoint_manager.delete_checkpoint(session_id, checkpoint_id)
+    
+    if not success:
+        raise HTTPException(status_code=404, detail="Checkpoint not found")
+    
+    return {
+        'session_id': session_id,
+        'checkpoint_id': checkpoint_id,
+        'message': 'Checkpoint deleted successfully'
     }
 
 

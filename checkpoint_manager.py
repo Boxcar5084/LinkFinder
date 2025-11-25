@@ -120,9 +120,16 @@ class CheckpointManager:
                 with open(checkpoint_file, 'rb') as f:
                     data = pickle.load(f)
 
+                # Extract checkpoint_id from filename (source of truth)
+                # Filename format: {session_id}_{checkpoint_id}.pkl
+                checkpoint_id = checkpoint_file.stem.split('_', 1)[1] if '_' in checkpoint_file.stem else None
+                
+                if not checkpoint_id:
+                    print(f"[WARN] Could not extract checkpoint_id from filename: {checkpoint_file.name}")
+                    continue
+
                 checkpoints.append({
-                    'checkpoint_id': data['state'].get('checkpoint_id',
-                                                      checkpoint_file.stem.split('_', 1)[1]),
+                    'checkpoint_id': checkpoint_id,
                     'timestamp': data['timestamp'],
                     'session_id': data['session_id']
                 })
@@ -211,6 +218,15 @@ class CheckpointManager:
             except Exception as e:
                 print(f"[ERR] Failed to delete checkpoint: {e}")
                 return False
+        else:
+            # Debug: list available checkpoints for this session
+            pattern = f"{session_id}_*.pkl"
+            available_files = list(self.checkpoint_dir.glob(pattern))
+            print(f"[DEL] Checkpoint file not found: {checkpoint_file}")
+            print(f"[DEL] Available checkpoints for session {session_id}:")
+            for f in available_files:
+                extracted_id = f.stem.split('_', 1)[1] if '_' in f.stem else 'N/A'
+                print(f"  - {f.name} (extracted checkpoint_id: {extracted_id})")
 
         return False
 

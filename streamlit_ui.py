@@ -136,6 +136,19 @@ def delete_session(session_id):
         st.error(f"Error: {e}")
     return False
 
+def delete_checkpoint(session_id, checkpoint_id):
+    """Delete a checkpoint"""
+    try:
+        response = requests.delete(f"{API_URL}/checkpoints/{session_id}/{checkpoint_id}", timeout=API_TIMEOUT)
+        if response.status_code == 200:
+            st.success("Checkpoint deleted")
+            return True
+        else:
+            st.error(f"Failed to delete checkpoint: {response.text}")
+    except Exception as e:
+        st.error(f"Error: {e}")
+    return False
+
 def get_status_badge(status):
     """Return status badge"""
     badges = {
@@ -379,7 +392,13 @@ with tab1:
                     
                     checkpoint_id = details.get('checkpoint_id')
                     if checkpoint_id:
-                        st.success(f"Checkpoint: {checkpoint_id[:16]}...")
+                        col1, col2 = st.columns([3, 1])
+                        with col1:
+                            st.success(f"Checkpoint: {checkpoint_id[:16]}...")
+                        with col2:
+                            if st.button("Delete Checkpoint", key=f"delete_checkpoint_{session_id}", use_container_width=True, type="secondary"):
+                                if delete_checkpoint(session_id, checkpoint_id):
+                                    st.rerun()
 
 # ========== TAB 2: NEW TRACE ==========
 with tab2:
@@ -483,17 +502,25 @@ with tab3:
         
         st.subheader(f"All Checkpoints ({len(checkpoints)})")
         
-        checkpoint_data = []
-        for cp in checkpoints[:20]:
-            checkpoint_data.append({
-                "Time": cp['timestamp'][:19],
-                "Session": cp['session_id'][:12] + "...",
-                "Status": cp['session_status'].upper(),
-                "ID": cp['checkpoint_id'][:12] + "..."
-            })
-        
-        if checkpoint_data:
-            st.dataframe(pd.DataFrame(checkpoint_data), use_container_width=True, hide_index=True)
+        # Display checkpoints with delete buttons
+        for idx, cp in enumerate(checkpoints[:20]):
+            col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 2, 1])
+            
+            with col1:
+                st.write(f"**{cp['timestamp'][:19]}**")
+            with col2:
+                st.write(cp['session_id'][:12] + "...")
+            with col3:
+                st.write(cp['session_status'].upper())
+            with col4:
+                st.write(cp['checkpoint_id'][:12] + "...")
+            with col5:
+                if st.button("🗑️", key=f"delete_cp_{idx}_{cp['checkpoint_id']}", help="Delete checkpoint"):
+                    if delete_checkpoint(cp['session_id'], cp['checkpoint_id']):
+                        st.rerun()
+            
+            if idx < len(checkpoints[:20]) - 1:
+                st.divider()
 
 # Footer
 st.divider()
