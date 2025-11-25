@@ -15,7 +15,10 @@ from config import (
     SKIP_MIXER_OUTPUT_THRESHOLD,
     SKIP_DISTRIBUTION_MAX_INPUTS,
     SKIP_DISTRIBUTION_MIN_OUTPUTS,
-    EXCHANGE_WALLET_THRESHOLD
+    EXCHANGE_WALLET_THRESHOLD,
+    MAX_INPUT_ADDRESSES_PER_TX,
+    MAX_OUTPUT_ADDRESSES_PER_TX,
+    USE_CACHE
 )
 
 
@@ -115,9 +118,12 @@ class BitcoinAddressLinker:
         if address in self._exchange_wallet_cache:
             return self._exchange_wallet_cache[address]
         
-        # Check if we have cached transactions - if so, use that count
-        block_range = (start_block, end_block) if (start_block or end_block) else None
-        cached_txs = self.cache.get_cached(address, block_range)
+        # Check if we have cached transactions - if so, use that count (with fallback mechanism)
+        if not USE_CACHE:
+            return False  # Cache disabled, can't check from cache
+        
+        block_range = (start_block, end_block) if (start_block is not None or end_block is not None) else None
+        cached_txs = self.cache.get_cached_with_fallback(address, block_range)
         
         if cached_txs is not None:
             # We have cached transactions, check the count
@@ -177,15 +183,21 @@ class BitcoinAddressLinker:
                              start_block: Optional[int] = None,
                              end_block: Optional[int] = None) -> List[Dict[str, Any]]:
         """Fetch transactions with smart filtering"""
-        block_range = (start_block, end_block) if (start_block or end_block) else None
+        block_range = (start_block, end_block) if (start_block is not None or end_block is not None) else None
 
         # Check cache for exchange wallet status first
         if address in self._exchange_wallet_cache and self._exchange_wallet_cache[address]:
             print(f"  [SKIP] Skipping exchange wallet (cached): {address}")
             return []
 
-        # Try to get from cache FIRST
-        cached = self.cache.get_cached(address, block_range)
+        # Try to get from cache FIRST (with fallback mechanism) - only if cache is enabled
+        cached = None
+        if USE_CACHE:
+            cached = self.cache.get_cached_with_fallback(address, block_range)
+            if cached is None:
+                # Explicitly log that we're about to make an API call
+                print(f"[DEBUG] Cache returned None for {address}, proceeding to API call", flush=True)
+        
         if cached:
             # Check if cached address is an exchange wallet
             # If we have cached transactions and count is > threshold, mark as exchange
@@ -195,8 +207,14 @@ class BitcoinAddressLinker:
                 return []
             return cached
 
-        print(f"[*] Fetching: {address}")
-        txs = await self.api.get_address_transactions(address, start_block, end_block)
+        # Cache miss or cache disabled - fetch from API
+        # IMPORTANT: This print should appear after every cache miss
+        print(f"[*] Fetching: {address} (cache miss, making API call)", flush=True)
+        try:
+            txs = await self.api.get_address_transactions(address, start_block, end_block)
+        except Exception as e:
+            print(f"  [ERROR] API call failed for {address}: {e}", flush=True)
+            raise
 
         # Validate txs is a list
         if not isinstance(txs, list):
@@ -235,8 +253,8 @@ class BitcoinAddressLinker:
         if hasattr(self, 'max_tx_per_address'):
             filtered_txs = filtered_txs[:self.max_tx_per_address]
 
-        # Cache the filtered results using .store() method
-        if filtered_txs:
+        # Cache the filtered results using .store() method - only if cache is enabled
+        if USE_CACHE and filtered_txs:
             try:
                 print(f"  [DEBUG] Attempting to cache {len(filtered_txs)} transactions for {address}")
                 self.cache.store(address, filtered_txs, block_range)
@@ -245,6 +263,8 @@ class BitcoinAddressLinker:
                 print(f"  [WARN] Error caching: {e}")
                 import traceback
                 traceback.print_exc()
+        elif not USE_CACHE:
+            print(f"  [DEBUG] Cache disabled - not storing transactions for {address}")
         else:
             print(f"  [DEBUG] No transactions to cache for {address} (filtered_txs is empty)")
 
@@ -379,6 +399,8 @@ class BitcoinAddressLinker:
 
         # Same for backward
         queued_backward_set = set(queued_backward) if queued_backward else set()
+        # Only mark as visited if they were actually explored (not just discovered)
+        # Addresses in queued_backward were discovered but NOT explored, so exclude them from visited
         backward_visited = set(addr for addr in visited_backward_dict.keys() if addr not in queued_backward_set)
         backward_discovered = dict(visited_backward_dict)
         
@@ -388,18 +410,25 @@ class BitcoinAddressLinker:
             for addr in queued_backward:
                 path = visited_backward_dict.get(addr, [addr])
                 backward_queue.append((addr, path))
+                # Remove from visited since we're going to explore it now
+                backward_visited.discard(addr)
         else:
-            # No queued addresses saved - all discovered addresses were fully explored
-            # Start fresh from initial addresses to find new connections
-            print(f"[DEBUG] No queued addresses - all {len(visited_backward_dict)} discovered addresses were explored")
+            # No queued addresses saved - check if addresses were actually explored or just discovered
+            # If they're in visited_backward_dict but we have no queue, they might have been marked as discovered
+            # without actually being explored. Re-queue them to ensure they get explored.
+            print(f"[DEBUG] No queued addresses - checking if {len(visited_backward_dict)} discovered addresses need exploration")
             print(f"[DEBUG] Starting fresh from initial addresses to find new connections")
             # Start from initial addresses - they may have new neighbors we haven't seen
             for addr in list_b:
-                if addr not in backward_visited:
-                    backward_queue.append((addr, [addr]))
+                # Remove from visited so we can explore it
+                backward_visited.discard(addr)
+                backward_queue.append((addr, [addr]))
+                print(f"[DEBUG]   Queued initial backward address for exploration: {addr}")
 
         # Alternating BFS
-        for current_depth in range(max_depth):
+        # Continue until max_depth is reached OR both queues are exhausted
+        current_depth = 0
+        while current_depth < max_depth:
             print(f"\n{'='*70}")
             print(f"[DEPTH {current_depth}]")
             print(f"{'='*70}")
@@ -431,11 +460,21 @@ class BitcoinAddressLinker:
 
                 try:
                     txs = await self.get_address_txs(current, start_block, end_block)
-
+                    
+                    output_count = 0
+                    skipped_outputs = 0
                     for tx in txs:
                         # FORWARD direction: Only follow OUTPUTS
                         # Who did this address send money TO?
                         outputs = self._extract_addresses(tx, 'output')
+                        total_outputs = len(outputs)
+                        output_count += total_outputs
+                        
+                        # Limit output addresses per transaction to prevent queue flooding
+                        if total_outputs > MAX_OUTPUT_ADDRESSES_PER_TX:
+                            outputs = list(outputs)[:MAX_OUTPUT_ADDRESSES_PER_TX]
+                            skipped_outputs += (total_outputs - MAX_OUTPUT_ADDRESSES_PER_TX)
+                            print(f"    [LIMIT] Transaction has {total_outputs} outputs, processing first {MAX_OUTPUT_ADDRESSES_PER_TX}")
                         
                         for neighbor in outputs:
                             if neighbor in forward_discovered:
@@ -511,6 +550,14 @@ class BitcoinAddressLinker:
                             forward_discovered[neighbor] = new_path
                             forward_queue.append((neighbor, new_path))
 
+                    if output_count == 0 and txs:
+                        print(f"    [DEBUG] Found {len(txs)} transactions but 0 extractable output addresses for {current}")
+                    elif output_count > 0:
+                        if skipped_outputs > 0:
+                            print(f"    [DEBUG] Found {output_count} output addresses from {len(txs)} transactions for {current} (skipped {skipped_outputs} due to limit)")
+                        else:
+                            print(f"    [DEBUG] Found {output_count} output addresses from {len(txs)} transactions for {current}")
+
                     addresses_explored += 1
 
                 except Exception as e:
@@ -545,11 +592,27 @@ class BitcoinAddressLinker:
 
                 try:
                     txs = await self.get_address_txs(current, start_block, end_block)
-
+                    
+                    if not txs:
+                        print(f"    [DEBUG] No transactions found for {current}")
+                    
+                    input_count = 0
+                    skipped_inputs = 0
                     for tx in txs:
                         # BACKWARD direction: Only follow INPUTS
                         # Who SENT money TO this address?
+                        # Note: Transactions with 50+ inputs AND 50+ outputs (extreme mixers) are already filtered
+                        # by _should_skip_transaction in get_address_txs()
                         inputs = self._extract_addresses(tx, 'input')
+                        total_inputs = len(inputs)
+                        input_count += total_inputs
+                        
+                        # Limit input addresses per transaction to prevent queue flooding
+                        # This handles transactions with many inputs that weren't filtered as extreme mixers
+                        if total_inputs > MAX_INPUT_ADDRESSES_PER_TX:
+                            inputs = list(inputs)[:MAX_INPUT_ADDRESSES_PER_TX]
+                            skipped_inputs += (total_inputs - MAX_INPUT_ADDRESSES_PER_TX)
+                            print(f"    [LIMIT] Transaction has {total_inputs} inputs, processing first {MAX_INPUT_ADDRESSES_PER_TX} (extreme mixers with 50+ inputs/outputs are already filtered)")
                         
                         for neighbor in inputs:
                             if neighbor in backward_discovered:
@@ -624,6 +687,14 @@ class BitcoinAddressLinker:
 
                             backward_discovered[neighbor] = new_path
                             backward_queue.append((neighbor, new_path))
+                    
+                    if input_count == 0 and txs:
+                        print(f"    [DEBUG] Found {len(txs)} transactions but 0 extractable input addresses for {current}")
+                    elif input_count > 0:
+                        if skipped_inputs > 0:
+                            print(f"    [DEBUG] Found {input_count} input addresses from {len(txs)} transactions for {current} (skipped {skipped_inputs} due to limit)")
+                        else:
+                            print(f"    [DEBUG] Found {input_count} input addresses from {len(txs)} transactions for {current}")
 
                     addresses_explored += 1
 
@@ -638,8 +709,12 @@ class BitcoinAddressLinker:
             print(f" Connections found: {len(results['connections_found'])}")
             print(f" Matched targets: {len(matched_targets)}/{len(list_b)}")
 
+            # Increment depth for next iteration
+            current_depth += 1
+            
+            # Check if we should continue
             if not forward_queue and not backward_queue:
-                print(f"\n[!] Both queues exhausted at depth {current_depth}")
+                print(f"\n[!] Both queues exhausted at depth {current_depth-1}")
                 break
 
         # Finalize results

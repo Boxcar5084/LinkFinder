@@ -8,6 +8,7 @@ from datetime import datetime
 import time
 import socket
 import json
+from config import EXPORT_DIR
 
 # Check for dialog support (Streamlit 1.34+)
 if hasattr(st, "dialog"):
@@ -374,7 +375,12 @@ def test_electrumx_connectivity(host, port, use_ssl=False, cert=None, timeout=5)
     except Exception as e:
         return False, f"Connection error: {str(e)}"
 
-def save_settings(default_api=None, mempool_api_key=None, electrumx_host=None, electrumx_port=None, electrumx_use_ssl=None, electrumx_cert=None):
+def save_settings(default_api=None, mempool_api_key=None, electrumx_host=None, electrumx_port=None, electrumx_use_ssl=None, electrumx_cert=None, use_cache=None,
+                  mixer_input_threshold=None, mixer_output_threshold=None, suspicious_ratio_threshold=None,
+                  skip_mixer_input_threshold=None, skip_mixer_output_threshold=None,
+                  skip_distribution_max_inputs=None, skip_distribution_min_outputs=None,
+                  max_transactions_per_address=None, max_depth=None, exchange_wallet_threshold=None,
+                  max_input_addresses_per_tx=None, max_output_addresses_per_tx=None):
     """Save settings to API"""
     try:
         payload = {}
@@ -390,6 +396,33 @@ def save_settings(default_api=None, mempool_api_key=None, electrumx_host=None, e
             payload['electrumx_use_ssl'] = electrumx_use_ssl
         if electrumx_cert is not None:
             payload['electrumx_cert'] = electrumx_cert
+        if use_cache is not None:
+            payload['use_cache'] = use_cache
+        # Threshold settings
+        if mixer_input_threshold is not None:
+            payload['mixer_input_threshold'] = mixer_input_threshold
+        if mixer_output_threshold is not None:
+            payload['mixer_output_threshold'] = mixer_output_threshold
+        if suspicious_ratio_threshold is not None:
+            payload['suspicious_ratio_threshold'] = suspicious_ratio_threshold
+        if skip_mixer_input_threshold is not None:
+            payload['skip_mixer_input_threshold'] = skip_mixer_input_threshold
+        if skip_mixer_output_threshold is not None:
+            payload['skip_mixer_output_threshold'] = skip_mixer_output_threshold
+        if skip_distribution_max_inputs is not None:
+            payload['skip_distribution_max_inputs'] = skip_distribution_max_inputs
+        if skip_distribution_min_outputs is not None:
+            payload['skip_distribution_min_outputs'] = skip_distribution_min_outputs
+        if max_transactions_per_address is not None:
+            payload['max_transactions_per_address'] = max_transactions_per_address
+        if max_depth is not None:
+            payload['max_depth'] = max_depth
+        if exchange_wallet_threshold is not None:
+            payload['exchange_wallet_threshold'] = exchange_wallet_threshold
+        if max_input_addresses_per_tx is not None:
+            payload['max_input_addresses_per_tx'] = max_input_addresses_per_tx
+        if max_output_addresses_per_tx is not None:
+            payload['max_output_addresses_per_tx'] = max_output_addresses_per_tx
         
         response = requests.post(f"{API_URL}/settings", json=payload, timeout=API_TIMEOUT)
         if response.status_code == 200:
@@ -434,7 +467,7 @@ with st.sidebar:
                 st.error(f"Error: {e}")
 
 # Main tabs
-tab1, tab2, tab3, tab4 = st.tabs(["Active Sessions", "New Trace", "Checkpoints", "Settings"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Active Sessions", "New Trace", "Checkpoints", "Found Connections", "Settings"])
 
 # ========== TAB 1: ACTIVE SESSIONS ==========
 with tab1:
@@ -1009,8 +1042,198 @@ with tab3:
             if idx < len(checkpoints[:20]) - 1:
                 st.divider()
 
-# ========== TAB 4: SETTINGS ==========
+# ========== TAB 4: FOUND CONNECTIONS ==========
 with tab4:
+    st.header("Found Connections")
+    st.markdown("View connections found in export files")
+    
+    def get_export_files():
+        """Scan exports directory and return list of export files with metadata"""
+        export_dir = Path(EXPORT_DIR)
+        if not export_dir.exists():
+            return []
+        
+        export_files = []
+        json_files = list(export_dir.glob("connections_*.json"))
+        
+        for json_file in json_files:
+            # Parse filename: connections_{session_id}_{timestamp}.json
+            filename = json_file.stem  # Remove .json extension
+            parts = filename.split('_', 2)  # Split on first two underscores
+            if len(parts) >= 3 and parts[0] == 'connections':
+                session_id = parts[1]
+                timestamp_str = '_'.join(parts[2:])  # Rejoin remaining parts for timestamp
+                
+                # Find corresponding CSV file
+                csv_file = export_dir / f"{filename}.csv"
+                
+                export_files.append({
+                    'session_id': session_id,
+                    'timestamp': timestamp_str,
+                    'json_path': str(json_file),
+                    'csv_path': str(csv_file) if csv_file.exists() else None,
+                    'filename': json_file.name
+                })
+        
+        # Sort by timestamp (newest first)
+        export_files.sort(key=lambda x: x['timestamp'], reverse=True)
+        return export_files
+    
+    def load_export_connections(json_path):
+        """Load and parse JSON export file to extract connections_found array"""
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                return data.get('connections_found', [])
+        except Exception as e:
+            st.error(f"Error loading export file {json_path}: {e}")
+            return []
+    
+    def get_active_session_ids():
+        """Fetch active session IDs from API"""
+        sessions = get_sessions()
+        return [s['session_id'] for s in sessions]
+    
+    # Get all export files
+    all_export_files = get_export_files()
+    
+    # Filter out files with 0 connections
+    export_files = []
+    for exp_file in all_export_files:
+        connections = load_export_connections(exp_file['json_path'])
+        if len(connections) > 0:
+            exp_file['connections'] = connections
+            export_files.append(exp_file)
+    
+    if not export_files:
+        st.info("No export files with connections found. Export files are created when sessions complete.")
+    else:
+        # Collect all connections from all export files and group by source/target
+        connections_by_pair = {}
+        
+        for exp_file in export_files:
+            connections = exp_file['connections']
+            session_id = exp_file['session_id']
+            timestamp = exp_file['timestamp']
+            
+            # Format timestamp for display (YYYYMMDD_HHMMSS -> YYYY-MM-DD HH:MM:SS)
+            try:
+                if len(timestamp) == 15 and '_' in timestamp:
+                    date_part = timestamp[:8]
+                    time_part = timestamp[9:]
+                    formatted_timestamp = f"{date_part[:4]}-{date_part[4:6]}-{date_part[6:8]} {time_part[:2]}:{time_part[2:4]}:{time_part[4:6]}"
+                else:
+                    formatted_timestamp = timestamp
+            except:
+                formatted_timestamp = timestamp
+            
+            for conn in connections:
+                source = conn.get('source', 'N/A')
+                target = conn.get('target', 'N/A')
+                pair_key = (source, target)
+                
+                if pair_key not in connections_by_pair:
+                    connections_by_pair[pair_key] = []
+                
+                # Store connection with metadata about which export file it came from
+                connections_by_pair[pair_key].append({
+                    'connection': conn,
+                    'session_id': session_id,
+                    'timestamp': formatted_timestamp,
+                    'export_file': exp_file
+                })
+        
+        # Calculate summary metrics
+        total_connections = sum(len(exp_file['connections']) for exp_file in export_files)
+        unique_pairs = len(connections_by_pair)
+        
+        # Display summary metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Export Files with Connections", len(export_files))
+        with col2:
+            st.metric("Total Connections", total_connections)
+        with col3:
+            st.metric("Unique Source/Target Pairs", unique_pairs)
+        
+        st.divider()
+        
+        # Display connections grouped by source/target pair, then by path
+        for idx, ((source, target), conn_list) in enumerate(connections_by_pair.items()):
+            # Truncate addresses for display if too long
+            source_display = source[:30] + "..." if len(source) > 30 else source
+            target_display = target[:30] + "..." if len(target) > 30 else target
+            
+            # Group connections by their actual path sequence
+            paths_by_sequence = {}
+            for conn_data in conn_list:
+                conn = conn_data['connection']
+                path = conn.get('path', [])
+                # Use tuple of path for hashing/comparison
+                path_key = tuple(path) if path else tuple()
+                
+                if path_key not in paths_by_sequence:
+                    paths_by_sequence[path_key] = {
+                        'path': path,
+                        'path_length': conn.get('path_count', len(path)),
+                        'depth': conn.get('found_at_depth', 'N/A'),
+                        'sessions': []
+                    }
+                
+                # Add session info to this path
+                paths_by_sequence[path_key]['sessions'].append({
+                    'session_id': conn_data['session_id'],
+                    'timestamp': conn_data['timestamp']
+                })
+            
+            unique_paths_count = len(paths_by_sequence)
+            
+            with st.expander(
+                f"**{source_display}** → **{target_display}** ({unique_paths_count} unique path{'s' if unique_paths_count > 1 else ''})",
+                expanded=False
+            ):
+                # Display source and target in full
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write(f"**Source:**")
+                    st.code(source, language=None)
+                with col2:
+                    st.write(f"**Target:**")
+                    st.code(target, language=None)
+                
+                st.divider()
+                
+                # Display all unique paths for this source/target pair
+                st.write(f"**Unique Paths Found ({unique_paths_count})**")
+                
+                for path_idx, (path_key, path_data) in enumerate(paths_by_sequence.items()):
+                    path = path_data['path']
+                    path_length = path_data['path_length']
+                    depth = path_data['depth']
+                    sessions = path_data['sessions']
+                    
+                    st.write(f"**Path {path_idx + 1}:**")
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.write(f"**Path Length:** {path_length} hops")
+                        st.write(f"**Found at Depth:** {depth}")
+                        st.write(f"**Found in {len(sessions)} session{'s' if len(sessions) > 1 else ''}:**")
+                        for sess_info in sessions:
+                            st.caption(f"• Session: {sess_info['session_id'][:12]}... | {sess_info['timestamp']}")
+                    with col_b:
+                        if path:
+                            st.write("**Path:**")
+                            path_str = ' → '.join(path)
+                            st.code(path_str, language=None)
+                    
+                    if path_idx < len(paths_by_sequence) - 1:
+                        st.divider()
+            
+            if idx < len(connections_by_pair) - 1:
+                st.divider()
+
+# ========== TAB 5: SETTINGS ==========
+with tab5:
     st.header("Settings")
     st.markdown("Configure API provider and authentication")
     
@@ -1179,6 +1402,262 @@ with tab4:
         
         st.divider()
         
+        # Cache Settings (Troubleshooting)
+        st.subheader("Cache Settings")
+        st.markdown("Enable or disable transaction caching for troubleshooting")
+        
+        current_use_cache = current_settings.get('use_cache', True)
+        use_cache = st.checkbox(
+            "Enable Transaction Cache",
+            value=current_use_cache,
+            key="settings_use_cache",
+            help="When enabled, transactions are cached to speed up subsequent searches. Disable to bypass cache for troubleshooting (e.g., if connections are not being found). Note: Server restart may be required for this setting to take effect."
+        )
+        
+        if not use_cache:
+            st.warning("⚠️ Cache is disabled. All transactions will be fetched from the API, which may be slower but ensures fresh data.")
+        
+        st.divider()
+        
+        # Tracing Thresholds Settings
+        st.subheader("Tracing Thresholds")
+        st.markdown("Configure thresholds for transaction filtering and tracing behavior")
+        
+        # Reset to suggested values button
+        col_reset1, col_reset2 = st.columns([1, 4])
+        with col_reset1:
+            if st.button("🔄 Reset to Suggested Values", key="reset_thresholds", type="secondary", help="Reset all tracing thresholds to their suggested default values"):
+                # Suggested/default values
+                suggested_values = {
+                    'mixer_input_threshold': 30,
+                    'mixer_output_threshold': 30,
+                    'suspicious_ratio_threshold': 10,
+                    'skip_mixer_input_threshold': 50,
+                    'skip_mixer_output_threshold': 50,
+                    'skip_distribution_max_inputs': 2,
+                    'skip_distribution_min_outputs': 100,
+                    'max_transactions_per_address': 50,
+                    'max_depth': 10,
+                    'exchange_wallet_threshold': 1000,
+                    'max_input_addresses_per_tx': 50,
+                    'max_output_addresses_per_tx': 50
+                }
+                
+                # Save immediately
+                with st.spinner("Resetting to suggested values..."):
+                    result = save_settings(
+                        mixer_input_threshold=suggested_values['mixer_input_threshold'],
+                        mixer_output_threshold=suggested_values['mixer_output_threshold'],
+                        suspicious_ratio_threshold=suggested_values['suspicious_ratio_threshold'],
+                        skip_mixer_input_threshold=suggested_values['skip_mixer_input_threshold'],
+                        skip_mixer_output_threshold=suggested_values['skip_mixer_output_threshold'],
+                        skip_distribution_max_inputs=suggested_values['skip_distribution_max_inputs'],
+                        skip_distribution_min_outputs=suggested_values['skip_distribution_min_outputs'],
+                        max_transactions_per_address=suggested_values['max_transactions_per_address'],
+                        max_depth=suggested_values['max_depth'],
+                        exchange_wallet_threshold=suggested_values['exchange_wallet_threshold'],
+                        max_input_addresses_per_tx=suggested_values['max_input_addresses_per_tx'],
+                        max_output_addresses_per_tx=suggested_values['max_output_addresses_per_tx']
+                    )
+                    
+                    if result:
+                        st.session_state.settings_save_success = True
+                        st.success("✅ All thresholds reset to suggested values!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error("Failed to reset thresholds")
+        
+        with col_reset2:
+            st.caption("Click to restore all tracing thresholds to their recommended default values")
+        
+        st.divider()
+        
+        # Get current threshold values from settings
+        current_mixer_input = current_settings.get('mixer_input_threshold', 30)
+        current_mixer_output = current_settings.get('mixer_output_threshold', 30)
+        current_suspicious_ratio = current_settings.get('suspicious_ratio_threshold', 10)
+        current_skip_mixer_input = current_settings.get('skip_mixer_input_threshold', 50)
+        current_skip_mixer_output = current_settings.get('skip_mixer_output_threshold', 50)
+        current_skip_dist_max_inputs = current_settings.get('skip_distribution_max_inputs', 2)
+        current_skip_dist_min_outputs = current_settings.get('skip_distribution_min_outputs', 100)
+        current_max_tx_per_addr = current_settings.get('max_transactions_per_address', 50)
+        current_max_depth = current_settings.get('max_depth', 10)
+        current_exchange_threshold = current_settings.get('exchange_wallet_threshold', 1000)
+        current_max_input_addrs = current_settings.get('max_input_addresses_per_tx', 50)
+        current_max_output_addrs = current_settings.get('max_output_addresses_per_tx', 50)
+        
+        # Mixer Detection Thresholds
+        with st.expander("Mixer Detection Thresholds", expanded=False):
+            st.markdown("""
+            **Purpose:** Identify mixer-like transactions that have many inputs and/or outputs.
+            These thresholds help detect privacy-focused transactions that may not be useful for tracing connections.
+            """)
+            
+            st.info("💡 **Suggested Values:** Input: 30, Output: 30, Ratio: 10 | These values are based on typical CoinJoin/mixer patterns where transactions have 30+ inputs/outputs. The ratio of 10 catches extreme imbalances (e.g., 1:10 or 10:1) that indicate suspicious patterns.")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                mixer_input_threshold = st.number_input(
+                    "Mixer Input Threshold",
+                    min_value=1,
+                    max_value=1000,
+                    value=current_mixer_input,
+                    key="settings_mixer_input",
+                    help="Minimum number of inputs to be considered 'mixer-like'. Transactions with this many or more inputs are flagged as potential mixers. Suggested: 30 (typical CoinJoin size)."
+                )
+            
+            with col2:
+                mixer_output_threshold = st.number_input(
+                    "Mixer Output Threshold",
+                    min_value=1,
+                    max_value=1000,
+                    value=current_mixer_output,
+                    key="settings_mixer_output",
+                    help="Minimum number of outputs to be considered 'mixer-like'. Transactions with this many or more outputs are flagged as potential mixers. Suggested: 30 (typical CoinJoin size)."
+                )
+            
+            suspicious_ratio_threshold = st.number_input(
+                "Suspicious Ratio Threshold",
+                min_value=1,
+                max_value=100,
+                value=current_suspicious_ratio,
+                key="settings_suspicious_ratio",
+                help="Input:output or output:input ratio to flag as suspicious. Transactions with extreme ratios (e.g., 1 input to 100 outputs) are flagged. Suggested: 10 (catches 10:1 or 1:10 imbalances)."
+            )
+        
+        # Transaction Filtering Thresholds
+        with st.expander("Transaction Filtering Thresholds", expanded=False):
+            st.markdown("""
+            **Purpose:** Filter out extreme mixer transactions that would flood the processing queue.
+            These transactions are skipped entirely to improve performance and focus on meaningful connections.
+            """)
+            
+            st.info("💡 **Suggested Values:** Input: 50, Output: 50 | These values filter out extreme mixers (50+ inputs/outputs) that would create thousands of queue entries. This threshold is higher than the detection threshold (30) to allow some mixer analysis while preventing queue flooding from massive CoinJoin transactions.")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                skip_mixer_input_threshold = st.number_input(
+                    "Skip Mixer Input Threshold",
+                    min_value=1,
+                    max_value=1000,
+                    value=current_skip_mixer_input,
+                    key="settings_skip_mixer_input",
+                    help="Minimum inputs for extreme mixer. Transactions with this many or more inputs are completely skipped (prevents queue flooding). Suggested: 50 (filters extreme mixers while allowing smaller ones)."
+                )
+            
+            with col2:
+                skip_mixer_output_threshold = st.number_input(
+                    "Skip Mixer Output Threshold",
+                    min_value=1,
+                    max_value=1000,
+                    value=current_skip_mixer_output,
+                    key="settings_skip_mixer_output",
+                    help="Minimum outputs for extreme mixer. Transactions with this many or more outputs are completely skipped (prevents queue flooding). Suggested: 50 (filters extreme mixers while allowing smaller ones)."
+                )
+        
+        # Airdrop/Distribution Detection
+        with st.expander("Airdrop/Distribution Detection (MOST IMPORTANT)", expanded=True):
+            st.markdown("""
+            **Purpose:** Filter out airdrop and distribution transactions that create false connections.
+            
+            **Why this is critical:** Airdrop transactions typically have 1-2 inputs and hundreds of outputs, 
+            connecting many unrelated addresses. These create false positive connections and should be filtered out.
+            """)
+            
+            st.warning("💡 **Suggested Values:** Max Inputs: 2, Min Outputs: 100 | Most airdrops have 1-2 inputs (single funding source) and 100+ outputs (many recipients). This pattern (few inputs, many outputs) is the signature of distribution transactions. Setting max inputs to 2 catches 99% of airdrops while allowing legitimate multi-input transactions. The 100 output threshold ensures we only filter true distributions, not normal transactions with many outputs.")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                skip_distribution_max_inputs = st.number_input(
+                    "Max Inputs for Distribution",
+                    min_value=1,
+                    max_value=10,
+                    value=current_skip_dist_max_inputs,
+                    key="settings_skip_dist_max_inputs",
+                    help="Maximum number of inputs to trigger distribution filter. Transactions with this many or fewer inputs AND the minimum outputs are considered distributions. Suggested: 2 (most airdrops have 1-2 inputs)."
+                )
+            
+            with col2:
+                skip_distribution_min_outputs = st.number_input(
+                    "Min Outputs for Distribution",
+                    min_value=10,
+                    max_value=10000,
+                    value=current_skip_dist_min_outputs,
+                    key="settings_skip_dist_min_outputs",
+                    help="Minimum number of outputs to trigger distribution filter. Transactions with max inputs AND this many or more outputs are skipped. Suggested: 100 (catches airdrops while allowing normal transactions)."
+                )
+        
+        # Processing Limits
+        with st.expander("Processing Limits", expanded=False):
+            st.markdown("""
+            **Purpose:** Limit processing to prevent resource exhaustion and focus on relevant transactions.
+            """)
+            
+            st.info("💡 **Suggested Values:** Max TX/Address: 50, Max Depth: 10, Exchange Threshold: 1000 | Limiting to 50 transactions per address balances thoroughness with performance. Depth of 10 allows tracing through multiple hops while preventing infinite loops. Exchange threshold of 1000 identifies high-volume addresses (exchanges, services) that aren't useful for tracing individual connections.")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                max_transactions_per_address = st.number_input(
+                    "Max Transactions Per Address",
+                    min_value=1,
+                    max_value=10000,
+                    value=current_max_tx_per_addr,
+                    key="settings_max_tx_per_addr",
+                    help="Maximum number of transactions to process per address. Addresses with more transactions are limited to this number. Suggested: 50 (balances thoroughness with performance)."
+                )
+            
+            with col2:
+                max_depth = st.number_input(
+                    "Max Tracing Depth",
+                    min_value=1,
+                    max_value=50,
+                    value=current_max_depth,
+                    key="settings_max_depth",
+                    help="Maximum depth for tracing connections. Stops tracing after this many hops from the starting addresses. Suggested: 10 (allows multi-hop tracing while preventing infinite loops)."
+                )
+            
+            exchange_wallet_threshold = st.number_input(
+                "Exchange Wallet Threshold",
+                min_value=100,
+                max_value=100000,
+                value=current_exchange_threshold,
+                key="settings_exchange_threshold",
+                help="Addresses with more than this many transactions are considered exchange wallets and are skipped entirely. Exchange wallets have too many transactions to be useful for tracing. Suggested: 1000 (identifies high-volume addresses like exchanges)."
+            )
+        
+        # Address Filtering Limits
+        with st.expander("Address Filtering Limits", expanded=False):
+            st.markdown("""
+            **Purpose:** Prevent queue flooding from transactions with many inputs or outputs.
+            These limits cap how many addresses are processed per transaction.
+            """)
+            
+            st.info("💡 **Suggested Values:** Max Input: 50, Max Output: 50 | These limits prevent queue flooding from large transactions while still processing a reasonable number of addresses. Transactions with 50+ inputs/outputs are already filtered by the skip mixer thresholds, so this acts as a safety net for edge cases. The value of 50 matches the skip mixer threshold to maintain consistency.")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                max_input_addresses_per_tx = st.number_input(
+                    "Max Input Addresses Per Transaction",
+                    min_value=1,
+                    max_value=1000,
+                    value=current_max_input_addrs,
+                    key="settings_max_input_addrs",
+                    help="Maximum input addresses to process per transaction. If a transaction has more inputs, only the first N are processed (prevents queue flooding). Suggested: 50 (matches skip mixer threshold, prevents queue flooding)."
+                )
+            
+            with col2:
+                max_output_addresses_per_tx = st.number_input(
+                    "Max Output Addresses Per Transaction",
+                    min_value=1,
+                    max_value=1000,
+                    value=current_max_output_addrs,
+                    key="settings_max_output_addrs",
+                    help="Maximum output addresses to process per transaction. If a transaction has more outputs, only the first N are processed (prevents queue flooding). Suggested: 50 (matches skip mixer threshold, prevents queue flooding)."
+                )
+        
+        st.divider()
+        
         # Show success message if settings were just saved
         if st.session_state.settings_save_success:
             st.success("Settings saved successfully!")
@@ -1212,7 +1691,20 @@ You can still save these settings, but the server may not be accessible when usi
                         electrumx_host=pending.get('electrumx_host'),
                         electrumx_port=pending.get('electrumx_port'),
                         electrumx_use_ssl=pending.get('electrumx_use_ssl'),
-                        electrumx_cert=pending.get('electrumx_cert')
+                        electrumx_cert=pending.get('electrumx_cert'),
+                        use_cache=pending.get('use_cache'),
+                        mixer_input_threshold=pending.get('mixer_input_threshold'),
+                        mixer_output_threshold=pending.get('mixer_output_threshold'),
+                        suspicious_ratio_threshold=pending.get('suspicious_ratio_threshold'),
+                        skip_mixer_input_threshold=pending.get('skip_mixer_input_threshold'),
+                        skip_mixer_output_threshold=pending.get('skip_mixer_output_threshold'),
+                        skip_distribution_max_inputs=pending.get('skip_distribution_max_inputs'),
+                        skip_distribution_min_outputs=pending.get('skip_distribution_min_outputs'),
+                        max_transactions_per_address=pending.get('max_transactions_per_address'),
+                        max_depth=pending.get('max_depth'),
+                        exchange_wallet_threshold=pending.get('exchange_wallet_threshold'),
+                        max_input_addresses_per_tx=pending.get('max_input_addresses_per_tx'),
+                        max_output_addresses_per_tx=pending.get('max_output_addresses_per_tx')
                     )
                     st.session_state.pending_electrumx_settings = None
                     # Clear test connection result to avoid duplicates
@@ -1269,10 +1761,61 @@ You can still save these settings, but the server may not be accessible when usi
                         if electrumx_cert != current_cert:
                             update_electrumx_cert = electrumx_cert
                     
+                    # Handle cache setting
+                    update_use_cache = None
+                    if use_cache != current_use_cache:
+                        update_use_cache = use_cache
+                    
+                    # Handle threshold settings
+                    update_mixer_input = None
+                    update_mixer_output = None
+                    update_suspicious_ratio = None
+                    update_skip_mixer_input = None
+                    update_skip_mixer_output = None
+                    update_skip_dist_max_inputs = None
+                    update_skip_dist_min_outputs = None
+                    update_max_tx_per_addr = None
+                    update_max_depth = None
+                    update_exchange_threshold = None
+                    update_max_input_addrs = None
+                    update_max_output_addrs = None
+                    
+                    if mixer_input_threshold != current_mixer_input:
+                        update_mixer_input = mixer_input_threshold
+                    if mixer_output_threshold != current_mixer_output:
+                        update_mixer_output = mixer_output_threshold
+                    if suspicious_ratio_threshold != current_suspicious_ratio:
+                        update_suspicious_ratio = suspicious_ratio_threshold
+                    if skip_mixer_input_threshold != current_skip_mixer_input:
+                        update_skip_mixer_input = skip_mixer_input_threshold
+                    if skip_mixer_output_threshold != current_skip_mixer_output:
+                        update_skip_mixer_output = skip_mixer_output_threshold
+                    if skip_distribution_max_inputs != current_skip_dist_max_inputs:
+                        update_skip_dist_max_inputs = skip_distribution_max_inputs
+                    if skip_distribution_min_outputs != current_skip_dist_min_outputs:
+                        update_skip_dist_min_outputs = skip_distribution_min_outputs
+                    if max_transactions_per_address != current_max_tx_per_addr:
+                        update_max_tx_per_addr = max_transactions_per_address
+                    if max_depth != current_max_depth:
+                        update_max_depth = max_depth
+                    if exchange_wallet_threshold != current_exchange_threshold:
+                        update_exchange_threshold = exchange_wallet_threshold
+                    if max_input_addresses_per_tx != current_max_input_addrs:
+                        update_max_input_addrs = max_input_addresses_per_tx
+                    if max_output_addresses_per_tx != current_max_output_addrs:
+                        update_max_output_addrs = max_output_addresses_per_tx
+                    
                     # Only save if something changed
                     if (update_provider is not None or update_key is not None or 
                         update_electrumx_host is not None or update_electrumx_port is not None or
-                        update_electrumx_use_ssl is not None or update_electrumx_cert is not None):
+                        update_electrumx_use_ssl is not None or update_electrumx_cert is not None or
+                        update_use_cache is not None or
+                        update_mixer_input is not None or update_mixer_output is not None or
+                        update_suspicious_ratio is not None or update_skip_mixer_input is not None or
+                        update_skip_mixer_output is not None or update_skip_dist_max_inputs is not None or
+                        update_skip_dist_min_outputs is not None or update_max_tx_per_addr is not None or
+                        update_max_depth is not None or update_exchange_threshold is not None or
+                        update_max_input_addrs is not None or update_max_output_addrs is not None):
                         
                         # Test connectivity if ElectrumX settings are being updated or provider is being switched to ElectrumX
                         connectivity_test_failed = False
@@ -1307,6 +1850,19 @@ You can still save these settings, but the server may not be accessible when usi
                                         'electrumx_port': update_electrumx_port,
                                         'electrumx_use_ssl': update_electrumx_use_ssl,
                                         'electrumx_cert': update_electrumx_cert,
+                                        'use_cache': update_use_cache,
+                                        'mixer_input_threshold': update_mixer_input,
+                                        'mixer_output_threshold': update_mixer_output,
+                                        'suspicious_ratio_threshold': update_suspicious_ratio,
+                                        'skip_mixer_input_threshold': update_skip_mixer_input,
+                                        'skip_mixer_output_threshold': update_skip_mixer_output,
+                                        'skip_distribution_max_inputs': update_skip_dist_max_inputs,
+                                        'skip_distribution_min_outputs': update_skip_dist_min_outputs,
+                                        'max_transactions_per_address': update_max_tx_per_addr,
+                                        'max_depth': update_max_depth,
+                                        'exchange_wallet_threshold': update_exchange_threshold,
+                                        'max_input_addresses_per_tx': update_max_input_addrs,
+                                        'max_output_addresses_per_tx': update_max_output_addrs,
                                         'host': test_host,
                                         'port': test_port,
                                         'error_message': error_message
@@ -1324,7 +1880,20 @@ You can still save these settings, but the server may not be accessible when usi
                                     electrumx_host=update_electrumx_host,
                                     electrumx_port=update_electrumx_port,
                                     electrumx_use_ssl=update_electrumx_use_ssl,
-                                    electrumx_cert=update_electrumx_cert
+                                    electrumx_cert=update_electrumx_cert,
+                                    use_cache=update_use_cache,
+                                    mixer_input_threshold=update_mixer_input,
+                                    mixer_output_threshold=update_mixer_output,
+                                    suspicious_ratio_threshold=update_suspicious_ratio,
+                                    skip_mixer_input_threshold=update_skip_mixer_input,
+                                    skip_mixer_output_threshold=update_skip_mixer_output,
+                                    skip_distribution_max_inputs=update_skip_dist_max_inputs,
+                                    skip_distribution_min_outputs=update_skip_dist_min_outputs,
+                                    max_transactions_per_address=update_max_tx_per_addr,
+                                    max_depth=update_max_depth,
+                                    exchange_wallet_threshold=update_exchange_threshold,
+                                    max_input_addresses_per_tx=update_max_input_addrs,
+                                    max_output_addresses_per_tx=update_max_output_addrs
                                 )
                                 
                                 if result:
@@ -1363,6 +1932,128 @@ You can still save these settings, but the server may not be accessible when usi
                 config_dict['electrumx'] = electrumx_config
             
             st.json(config_dict)
+        
+        st.divider()
+        
+        # Export File Management
+        st.subheader("Export File Management")
+        st.markdown("Delete export files that have no connections and are not part of active sessions")
+        
+        def get_export_files_to_delete():
+            """Identify export files that have no connections and are not part of active sessions"""
+            export_dir = Path(EXPORT_DIR)
+            if not export_dir.exists():
+                return []
+            
+            # Get active session IDs
+            sessions = get_sessions()
+            active_session_ids = [s['session_id'] for s in sessions]
+            files_to_delete = []
+            
+            json_files = list(export_dir.glob("connections_*.json"))
+            for json_file in json_files:
+                # Parse session_id from filename
+                filename = json_file.stem
+                parts = filename.split('_', 2)
+                if len(parts) >= 3 and parts[0] == 'connections':
+                    session_id = parts[1]
+                    
+                    # Check if session is active
+                    if session_id in active_session_ids:
+                        continue
+                    
+                    # Check if file has connections
+                    try:
+                        with open(json_file, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                            connections = data.get('connections_found', [])
+                            if len(connections) == 0:
+                                # Find corresponding CSV file
+                                csv_file = export_dir / f"{filename}.csv"
+                                files_to_delete.append({
+                                    'session_id': session_id,
+                                    'json_path': str(json_file),
+                                    'csv_path': str(csv_file) if csv_file.exists() else None,
+                                    'filename': json_file.name
+                                })
+                    except Exception:
+                        # If we can't read the file, skip it
+                        continue
+            
+            return files_to_delete
+        
+        def delete_export_files(file_paths):
+            """Delete specified export files"""
+            deleted = []
+            errors = []
+            
+            for file_info in file_paths:
+                try:
+                    # Delete JSON file
+                    json_path = Path(file_info['json_path'])
+                    if json_path.exists():
+                        json_path.unlink()
+                        deleted.append(file_info['json_path'])
+                    
+                    # Delete CSV file if it exists
+                    if file_info['csv_path']:
+                        csv_path = Path(file_info['csv_path'])
+                        if csv_path.exists():
+                            csv_path.unlink()
+                            deleted.append(file_info['csv_path'])
+                except Exception as e:
+                    errors.append(f"Error deleting {file_info['filename']}: {e}")
+            
+            return deleted, errors
+        
+        # Get files eligible for deletion
+        files_to_delete = get_export_files_to_delete()
+        
+        if files_to_delete:
+            st.info(f"Found {len(files_to_delete)} export file(s) eligible for deletion")
+            
+            # Show list of files to be deleted
+            with st.expander("View files to be deleted", expanded=False):
+                for file_info in files_to_delete:
+                    st.write(f"- `{file_info['filename']}` (Session: {file_info['session_id'][:12]}...)")
+            
+            # Delete button with confirmation
+            if 'confirm_delete_exports' not in st.session_state:
+                st.session_state.confirm_delete_exports = False
+            
+            if not st.session_state.confirm_delete_exports:
+                if st.button("Delete Empty Export Files", width='stretch', type="secondary"):
+                    st.session_state.confirm_delete_exports = True
+                    st.rerun()
+            else:
+                st.warning(f"⚠️ **Confirm Deletion**")
+                st.write(f"This will delete {len(files_to_delete)} export file(s) and their corresponding CSV files.")
+                st.write("**Files to be deleted:**")
+                for file_info in files_to_delete:
+                    st.write(f"- `{file_info['filename']}`")
+                    if file_info['csv_path']:
+                        csv_filename = Path(file_info['csv_path']).name
+                        st.write(f"  - `{csv_filename}`")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("Confirm Delete", width='stretch', type="primary"):
+                        deleted, errors = delete_export_files(files_to_delete)
+                        if errors:
+                            for error in errors:
+                                st.error(error)
+                        if deleted:
+                            st.success(f"✅ Deleted {len(deleted)} file(s)")
+                            st.session_state.confirm_delete_exports = False
+                            time.sleep(1)
+                            st.rerun()
+                with col2:
+                    if st.button("Cancel", width='stretch', type="secondary"):
+                        st.session_state.confirm_delete_exports = False
+                        st.rerun()
+        else:
+            st.success("✅ No export files eligible for deletion")
+            st.caption("All export files either have connections or are part of active sessions")
     else:
         st.error("Could not load settings. Make sure the API server is running.")
         if st.button("Retry", width='stretch'):

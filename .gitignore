@@ -15,3 +15,5 @@ __pycache__/
 .env.*.local
 .env.*
 !.env.example
+list_b.txt
+list_a.txt

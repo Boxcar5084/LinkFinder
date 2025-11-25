@@ -52,23 +52,27 @@ ELECTRS_HOST = "100.94.34.56"  # Deprecated
 ELECTRS_PORT = 50001  # Deprecated
 
 
-MIXER_INPUT_THRESHOLD = 30          # Min inputs to be considered "mixer-like"  100-100-50
-MIXER_OUTPUT_THRESHOLD = 30         # Min outputs to be considered "mixer-like"  50-50-20
-SUSPICIOUS_RATIO_THRESHOLD = 10     # Input:output or output:input ratio to flag  30-30-10
+MIXER_INPUT_THRESHOLD = int(os.getenv("MIXER_INPUT_THRESHOLD", "30"))          # Min inputs to be considered "mixer-like"  100-100-50
+MIXER_OUTPUT_THRESHOLD = int(os.getenv("MIXER_OUTPUT_THRESHOLD", "30"))         # Min outputs to be considered "mixer-like"  50-50-20
+SUSPICIOUS_RATIO_THRESHOLD = int(os.getenv("SUSPICIOUS_RATIO_THRESHOLD", "10"))     # Input:output or output:input ratio to flag  30-30-10
 
 # Transaction filtering thresholds
-SKIP_MIXER_INPUT_THRESHOLD = 50           # Min inputs for extreme mixer
-SKIP_MIXER_OUTPUT_THRESHOLD = 50          # Min outputs for extreme mixer
+SKIP_MIXER_INPUT_THRESHOLD = int(os.getenv("SKIP_MIXER_INPUT_THRESHOLD", "50"))           # Min inputs for extreme mixer
+SKIP_MIXER_OUTPUT_THRESHOLD = int(os.getenv("SKIP_MIXER_OUTPUT_THRESHOLD", "50"))          # Min outputs for extreme mixer
 
 # Airdrop/Distribution detection (MOST IMPORTANT!)
-SKIP_DISTRIBUTION_MAX_INPUTS = 2          # Max inputs to trigger filter
-SKIP_DISTRIBUTION_MIN_OUTPUTS = 100       # Min outputs to trigger filter
+SKIP_DISTRIBUTION_MAX_INPUTS = int(os.getenv("SKIP_DISTRIBUTION_MAX_INPUTS", "2"))          # Max inputs to trigger filter
+SKIP_DISTRIBUTION_MIN_OUTPUTS = int(os.getenv("SKIP_DISTRIBUTION_MIN_OUTPUTS", "100"))       # Min outputs to trigger filter
 
-MAX_TRANSACTIONS_PER_ADDRESS = 50
-MAX_DEPTH = 10
+MAX_TRANSACTIONS_PER_ADDRESS = int(os.getenv("MAX_TRANSACTIONS_PER_ADDRESS", "50"))
+MAX_DEPTH = int(os.getenv("MAX_DEPTH", "10"))
 
 # Exchange wallet detection
-EXCHANGE_WALLET_THRESHOLD = 1000  # Addresses with more than this many transactions are considered exchange wallets
+EXCHANGE_WALLET_THRESHOLD = int(os.getenv("EXCHANGE_WALLET_THRESHOLD", "1000"))  # Addresses with more than this many transactions are considered exchange wallets
+
+# Input/Output address filtering
+MAX_INPUT_ADDRESSES_PER_TX = int(os.getenv("MAX_INPUT_ADDRESSES_PER_TX", "50"))  # Maximum input addresses to process per transaction (prevents queue flooding)
+MAX_OUTPUT_ADDRESSES_PER_TX = int(os.getenv("MAX_OUTPUT_ADDRESSES_PER_TX", "50"))  # Maximum output addresses to process per transaction (prevents queue flooding)
 
 # Cache management
 CACHE_MAX_SIZE_MB = 2048           # Maximum cache size in MB
@@ -77,6 +81,7 @@ CACHE_SINGLE_ENTRY_LIMIT_MB = 100  # Max size for single entry (skip if larger)
 
 # Alternative: Disable cache entirely for huge datasets
 DISABLE_CACHE = False              # Set to True to disable caching
+USE_CACHE = os.getenv("USE_CACHE", "true").lower() == "true"  # Enable/disable cache (default: enabled)
 CACHE_ONLY_ESSENTIAL = False       # Only cache addresses with <5 transactions
 
 

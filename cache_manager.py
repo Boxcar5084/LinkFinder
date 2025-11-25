@@ -186,10 +186,12 @@ class TransactionCache:
             return f"{address}_{block_range[0]}_{block_range[1]}"
         return f"{address}_None"
     
-    def get_cached(self, address: str, block_range: Optional[Tuple] = None) -> Optional[List]:
-        """Get from cache if exists"""
+    def _get_cached_internal(self, address: str, block_range: Optional[Tuple] = None) -> Optional[List]:
+        """
+        Internal method to get from cache without updating stats.
+        Used by both get_cached() and get_cached_with_fallback().
+        """
         key = self._make_key(address, block_range)
-        self.total_requests += 1
         
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
@@ -214,32 +216,120 @@ class TransactionCache:
             
             # Deserialize and return
             transactions = pickle.loads(row[0])
+            conn.close()
+            return transactions
+        
+        conn.close()
+        return None
+
+    def get_cached(self, address: str, block_range: Optional[Tuple] = None) -> Optional[List]:
+        """Get from cache if exists"""
+        self.total_requests += 1
+        
+        transactions = self._get_cached_internal(address, block_range)
+        
+        if transactions is not None:
             self.cache_hits += 1
             self._save_stats()
-            
-            conn.close()
             # Only print hit every 10th time to reduce noise
             if self.cache_hits % 10 == 0:
                 print(f"[CACHE HIT #{self.cache_hits}] {address} - {len(transactions)} transactions")
             return transactions
         
-        conn.close()
+        # Cache miss - no logging
+        self._save_stats()
+        return None
+
+    def _get_block_height(self, tx: Dict[str, Any]) -> Optional[int]:
+        """
+        Extract block height from transaction, handling different formats:
+        - blockchain.info: tx.get('block_height')
+        - mempool: tx.get('status', {}).get('block_height')
+        - electrumx: similar format
+        """
+        # Try mempool format first (most common)
+        block_height = tx.get('status', {}).get('block_height')
+        if block_height is not None:
+            return block_height
         
-        # Cache miss - only print occasionally to reduce noise
-        if self.total_requests % 20 == 0:
-            print(f"[CACHE MISS #{self.total_requests}] {address}")
-            # Show sample of existing keys
-            conn = sqlite3.connect(self.db_path)
-            c = conn.cursor()
-            c.execute('SELECT cache_key FROM cached_transactions LIMIT 5')
-            existing_keys = [row[0] for row in c.fetchall()]
-            conn.close()
+        # Try blockchain.info format
+        block_height = tx.get('block_height')
+        if block_height is not None:
+            return block_height
+        
+        return None
+
+    def _filter_transactions_by_block_range(self, txs: List[Dict], start_block: Optional[int], end_block: Optional[int]) -> List[Dict]:
+        """
+        Filter transactions by block range, handling unconfirmed transactions (block_height = None/0).
+        Returns only transactions within the specified block range.
+        """
+        if not txs:
+            return []
+        
+        filtered = []
+        for tx in txs:
+            block_height = self._get_block_height(tx)
             
-            if existing_keys:
-                print(f"[CACHE DEBUG] Existing keys sample: {existing_keys}")
-            else:
-                print(f"[CACHE DEBUG] Cache is empty - no entries stored yet")
+            # Skip unconfirmed transactions (block_height is None or 0)
+            if block_height is None or block_height == 0:
+                continue
+            
+            # Check if in range
+            if start_block is not None and block_height < start_block:
+                continue
+            
+            if end_block is not None and block_height > end_block:
+                continue
+            
+            filtered.append(tx)
         
+        return filtered
+
+    def get_cached_with_fallback(self, address: str, block_range: Optional[Tuple] = None) -> Optional[List]:
+        """
+        Get from cache with fallback mechanism:
+        1. First tries exact block_range match
+        2. If not found and block_range was specified, tries lookup without block_range (all transactions)
+        3. If found without block_range, filters transactions to the requested range
+        4. Returns filtered results or None if no cache found
+        """
+        self.total_requests += 1
+        
+        # Step 1: Try exact block_range match first
+        exact_match = self._get_cached_internal(address, block_range)
+        if exact_match is not None:
+            # Exact cache hit
+            self.cache_hits += 1
+            self._save_stats()
+            if self.cache_hits % 10 == 0:
+                print(f"[CACHE HIT (exact)] {address} - {len(exact_match)} transactions")
+            return exact_match
+        
+        # Step 2: If block_range was specified, try fallback to broader cache (all transactions)
+        if block_range is not None:
+            start_block, end_block = block_range
+            
+            # Try lookup without block_range
+            broader_match = self._get_cached_internal(address, None)
+            if broader_match is not None:
+                # Found broader cache - filter to requested range
+                filtered_txs = self._filter_transactions_by_block_range(broader_match, start_block, end_block)
+                
+                if filtered_txs:
+                    # Fallback cache hit with filtering
+                    self.cache_hits += 1
+                    self._save_stats()
+                    print(f"[CACHE HIT (fallback)] {address} - filtered {len(broader_match)} -> {len(filtered_txs)} transactions (range: {start_block}-{end_block})")
+                    return filtered_txs
+                else:
+                    # Broader cache exists but no transactions in range
+                    print(f"[CACHE MISS (fallback, empty after filter)] {address} - {len(broader_match)} transactions, none in range {start_block}-{end_block}")
+                    self._save_stats()
+                    return None
+        
+        # Step 3: No cache found at all
+        print(f"[CACHE MISS] {address} - no cached data found")
         self._save_stats()
         return None
 

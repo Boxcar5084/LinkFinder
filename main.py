@@ -107,8 +107,31 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
         csv_path, json_path = export_manager.initialize_incremental_export(session_id)
         sessions[session_id]['exports'] = {'csv': csv_path, 'json': json_path}
 
-        # Create connection callback for incremental exports
+        # If resuming from checkpoint, restore existing connections to export files
+        # checkpoint_state is retrieved above (line 94)
+        if checkpoint_state:
+            existing_connections = checkpoint_state.get('connections_found', [])
+            if existing_connections:
+                print(f"[RESUME] Restoring {len(existing_connections)} connection(s) to export files...")
+                # Get progress info from session's trace_state if available
+                progress_info = sessions[session_id].get('progress', {})
+                addresses_examined = progress_info.get('addresses_examined', 0)
+                search_depth = checkpoint_state.get('search_depth', 0)
+                
+                for conn in existing_connections:
+                    # Restore each connection to export files
+                    export_manager.append_connection(
+                        session_id,
+                        conn,
+                        addresses_examined,
+                        search_depth,
+                        None,  # block_range not stored in checkpoint
+                        'resumed'
+                    )
+
+        # Create connection callback for incremental exports and checkpoint updates
         def connection_callback(connection, total_addresses, search_depth, block_range, status):
+            # Save to export files immediately
             export_manager.append_connection(
                 session_id,
                 connection,
@@ -117,6 +140,20 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
                 block_range,
                 status
             )
+            
+            # Update trace_state immediately so checkpoint includes this connection
+            if session_id in sessions and 'trace_state' in sessions[session_id]:
+                if 'connections_found' not in sessions[session_id]['trace_state']:
+                    sessions[session_id]['trace_state']['connections_found'] = []
+                
+                # Check for duplicates before adding
+                connection_key = (connection.get('source'), connection.get('target'))
+                existing_connections = sessions[session_id]['trace_state']['connections_found']
+                existing_keys = {(c.get('source'), c.get('target')) for c in existing_connections}
+                
+                if connection_key not in existing_keys:
+                    sessions[session_id]['trace_state']['connections_found'].append(connection)
+                    print(f"  [CHECKPOINT] Connection added to trace_state: {connection_key[0][:12]}... -> {connection_key[1][:12]}...")
 
         # NEW: Start periodic checkpoint task
         checkpoint_task = asyncio.create_task(
@@ -1024,6 +1061,20 @@ class SettingsUpdate(BaseModel):
     electrumx_port: Optional[int] = None
     electrumx_use_ssl: Optional[str] = None
     electrumx_cert: Optional[str] = None
+    use_cache: Optional[bool] = None
+    # Threshold settings
+    mixer_input_threshold: Optional[int] = None
+    mixer_output_threshold: Optional[int] = None
+    suspicious_ratio_threshold: Optional[int] = None
+    skip_mixer_input_threshold: Optional[int] = None
+    skip_mixer_output_threshold: Optional[int] = None
+    skip_distribution_max_inputs: Optional[int] = None
+    skip_distribution_min_outputs: Optional[int] = None
+    max_transactions_per_address: Optional[int] = None
+    max_depth: Optional[int] = None
+    exchange_wallet_threshold: Optional[int] = None
+    max_input_addresses_per_tx: Optional[int] = None
+    max_output_addresses_per_tx: Optional[int] = None
 
 
 def _read_env_file() -> Dict[str, str]:
@@ -1080,6 +1131,22 @@ async def get_settings():
     # Re-read from environment to get current values
     env_vars = _read_env_file()
     
+    from config import (
+        USE_CACHE,
+        MIXER_INPUT_THRESHOLD,
+        MIXER_OUTPUT_THRESHOLD,
+        SUSPICIOUS_RATIO_THRESHOLD,
+        SKIP_MIXER_INPUT_THRESHOLD,
+        SKIP_MIXER_OUTPUT_THRESHOLD,
+        SKIP_DISTRIBUTION_MAX_INPUTS,
+        SKIP_DISTRIBUTION_MIN_OUTPUTS,
+        MAX_TRANSACTIONS_PER_ADDRESS,
+        MAX_DEPTH,
+        EXCHANGE_WALLET_THRESHOLD,
+        MAX_INPUT_ADDRESSES_PER_TX,
+        MAX_OUTPUT_ADDRESSES_PER_TX
+    )
+    
     return {
         'default_api': env_vars.get('DEFAULT_API', DEFAULT_API),
         'mempool_api_key': env_vars.get('MEMPOOL_API_KEY', ''),
@@ -1088,7 +1155,21 @@ async def get_settings():
         'electrumx_port': env_vars.get('ELECTRUMX_PORT', ''),
         'electrumx_use_ssl': env_vars.get('ELECTRUMX_USE_SSL', ''),
         'electrumx_cert': env_vars.get('ELECTRUMX_CERT', ''),
-        'available_providers': ['mempool', 'blockchain', 'electrumx']
+        'use_cache': USE_CACHE,
+        'available_providers': ['mempool', 'blockchain', 'electrumx'],
+        # Threshold settings
+        'mixer_input_threshold': int(env_vars.get('MIXER_INPUT_THRESHOLD', MIXER_INPUT_THRESHOLD)),
+        'mixer_output_threshold': int(env_vars.get('MIXER_OUTPUT_THRESHOLD', MIXER_OUTPUT_THRESHOLD)),
+        'suspicious_ratio_threshold': int(env_vars.get('SUSPICIOUS_RATIO_THRESHOLD', SUSPICIOUS_RATIO_THRESHOLD)),
+        'skip_mixer_input_threshold': int(env_vars.get('SKIP_MIXER_INPUT_THRESHOLD', SKIP_MIXER_INPUT_THRESHOLD)),
+        'skip_mixer_output_threshold': int(env_vars.get('SKIP_MIXER_OUTPUT_THRESHOLD', SKIP_MIXER_OUTPUT_THRESHOLD)),
+        'skip_distribution_max_inputs': int(env_vars.get('SKIP_DISTRIBUTION_MAX_INPUTS', SKIP_DISTRIBUTION_MAX_INPUTS)),
+        'skip_distribution_min_outputs': int(env_vars.get('SKIP_DISTRIBUTION_MIN_OUTPUTS', SKIP_DISTRIBUTION_MIN_OUTPUTS)),
+        'max_transactions_per_address': int(env_vars.get('MAX_TRANSACTIONS_PER_ADDRESS', MAX_TRANSACTIONS_PER_ADDRESS)),
+        'max_depth': int(env_vars.get('MAX_DEPTH', MAX_DEPTH)),
+        'exchange_wallet_threshold': int(env_vars.get('EXCHANGE_WALLET_THRESHOLD', EXCHANGE_WALLET_THRESHOLD)),
+        'max_input_addresses_per_tx': int(env_vars.get('MAX_INPUT_ADDRESSES_PER_TX', MAX_INPUT_ADDRESSES_PER_TX)),
+        'max_output_addresses_per_tx': int(env_vars.get('MAX_OUTPUT_ADDRESSES_PER_TX', MAX_OUTPUT_ADDRESSES_PER_TX))
     }
 
 
@@ -1141,6 +1222,73 @@ async def update_settings(settings: SettingsUpdate):
         os.environ['ELECTRUMX_CERT'] = settings.electrumx_cert
         updated.append('electrumx_cert')
     
+    # Update USE_CACHE if provided
+    if settings.use_cache is not None:
+        env_vars['USE_CACHE'] = 'true' if settings.use_cache else 'false'
+        os.environ['USE_CACHE'] = env_vars['USE_CACHE']
+        updated.append('use_cache')
+    
+    # Update threshold settings if provided
+    if settings.mixer_input_threshold is not None:
+        env_vars['MIXER_INPUT_THRESHOLD'] = str(settings.mixer_input_threshold)
+        os.environ['MIXER_INPUT_THRESHOLD'] = str(settings.mixer_input_threshold)
+        updated.append('mixer_input_threshold')
+    
+    if settings.mixer_output_threshold is not None:
+        env_vars['MIXER_OUTPUT_THRESHOLD'] = str(settings.mixer_output_threshold)
+        os.environ['MIXER_OUTPUT_THRESHOLD'] = str(settings.mixer_output_threshold)
+        updated.append('mixer_output_threshold')
+    
+    if settings.suspicious_ratio_threshold is not None:
+        env_vars['SUSPICIOUS_RATIO_THRESHOLD'] = str(settings.suspicious_ratio_threshold)
+        os.environ['SUSPICIOUS_RATIO_THRESHOLD'] = str(settings.suspicious_ratio_threshold)
+        updated.append('suspicious_ratio_threshold')
+    
+    if settings.skip_mixer_input_threshold is not None:
+        env_vars['SKIP_MIXER_INPUT_THRESHOLD'] = str(settings.skip_mixer_input_threshold)
+        os.environ['SKIP_MIXER_INPUT_THRESHOLD'] = str(settings.skip_mixer_input_threshold)
+        updated.append('skip_mixer_input_threshold')
+    
+    if settings.skip_mixer_output_threshold is not None:
+        env_vars['SKIP_MIXER_OUTPUT_THRESHOLD'] = str(settings.skip_mixer_output_threshold)
+        os.environ['SKIP_MIXER_OUTPUT_THRESHOLD'] = str(settings.skip_mixer_output_threshold)
+        updated.append('skip_mixer_output_threshold')
+    
+    if settings.skip_distribution_max_inputs is not None:
+        env_vars['SKIP_DISTRIBUTION_MAX_INPUTS'] = str(settings.skip_distribution_max_inputs)
+        os.environ['SKIP_DISTRIBUTION_MAX_INPUTS'] = str(settings.skip_distribution_max_inputs)
+        updated.append('skip_distribution_max_inputs')
+    
+    if settings.skip_distribution_min_outputs is not None:
+        env_vars['SKIP_DISTRIBUTION_MIN_OUTPUTS'] = str(settings.skip_distribution_min_outputs)
+        os.environ['SKIP_DISTRIBUTION_MIN_OUTPUTS'] = str(settings.skip_distribution_min_outputs)
+        updated.append('skip_distribution_min_outputs')
+    
+    if settings.max_transactions_per_address is not None:
+        env_vars['MAX_TRANSACTIONS_PER_ADDRESS'] = str(settings.max_transactions_per_address)
+        os.environ['MAX_TRANSACTIONS_PER_ADDRESS'] = str(settings.max_transactions_per_address)
+        updated.append('max_transactions_per_address')
+    
+    if settings.max_depth is not None:
+        env_vars['MAX_DEPTH'] = str(settings.max_depth)
+        os.environ['MAX_DEPTH'] = str(settings.max_depth)
+        updated.append('max_depth')
+    
+    if settings.exchange_wallet_threshold is not None:
+        env_vars['EXCHANGE_WALLET_THRESHOLD'] = str(settings.exchange_wallet_threshold)
+        os.environ['EXCHANGE_WALLET_THRESHOLD'] = str(settings.exchange_wallet_threshold)
+        updated.append('exchange_wallet_threshold')
+    
+    if settings.max_input_addresses_per_tx is not None:
+        env_vars['MAX_INPUT_ADDRESSES_PER_TX'] = str(settings.max_input_addresses_per_tx)
+        os.environ['MAX_INPUT_ADDRESSES_PER_TX'] = str(settings.max_input_addresses_per_tx)
+        updated.append('max_input_addresses_per_tx')
+    
+    if settings.max_output_addresses_per_tx is not None:
+        env_vars['MAX_OUTPUT_ADDRESSES_PER_TX'] = str(settings.max_output_addresses_per_tx)
+        os.environ['MAX_OUTPUT_ADDRESSES_PER_TX'] = str(settings.max_output_addresses_per_tx)
+        updated.append('max_output_addresses_per_tx')
+    
     # Write to .env file
     _write_env_file(env_vars)
     
@@ -1154,7 +1302,8 @@ async def update_settings(settings: SettingsUpdate):
         'updated_fields': updated,
         'current_settings': {
             'default_api': env_vars.get('DEFAULT_API', 'mempool'),
-            'mempool_api_key_set': bool(env_vars.get('MEMPOOL_API_KEY', ''))
+            'mempool_api_key_set': bool(env_vars.get('MEMPOOL_API_KEY', '')),
+            'use_cache': env_vars.get('USE_CACHE', 'true').lower() == 'true'
         }
     }
 
