@@ -111,7 +111,15 @@ The web UI will open automatically at `http://localhost:8501`
 
 ## 🖥️ Using the Web Interface
 
-### 1. New Trace Tab
+### 1. Active Sessions Tab
+
+Monitor running and completed traces:
+
+- **Running**: View progress, stop traces, see live checkpoint stats
+- **Completed**: View results, download exports, delete sessions
+- **Cancelled/Failed**: Resume from checkpoint or delete
+
+### 2. New Trace Tab
 
 Enter Bitcoin addresses to trace:
 
@@ -124,14 +132,6 @@ Enter Bitcoin addresses to trace:
 
 Click **Start Trace** to begin searching for connections.
 
-### 2. Active Sessions Tab
-
-Monitor running and completed traces:
-
-- **Running**: View progress, stop traces, see live checkpoint stats
-- **Completed**: View results, download exports, delete sessions
-- **Cancelled/Failed**: Resume from checkpoint or delete
-
 ### 3. Checkpoints & Recovery Tab
 
 Manage saved checkpoints:
@@ -139,6 +139,14 @@ Manage saved checkpoints:
 - **Resume Latest**: Continue the most recent trace
 - **View All**: Browse all checkpoints with progress details
 - **Resume Specific**: Restart from any saved checkpoint
+
+### 4. Found Connections Tab
+
+View detailed list of all connections found across all sessions.
+
+### 5. Settings Tab
+
+Configure API providers, caching, and filtering thresholds directly from the UI.
 
 ---
 
@@ -276,10 +284,13 @@ linkfinder/
 ## 🧪 Testing
 
 ```bash
-# Test API connectivity
+# Test API connectivity (Host & ElectrumX)
 python test_connectivity.py
 
-# Test a specific provider
+# Test sequential queries (Simulate real usage)
+python test_provider_queries.py
+
+# Test a specific provider backend
 python test_api.py
 
 # Test with a known address

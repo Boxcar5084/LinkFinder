@@ -5,3 +5,4 @@ pandas>=2.2.0
 networkx==3.2
 pydantic>=2.5.0
 python-dotenv==1.0.0
+base58>=2.1.1
