@@ -275,47 +275,270 @@ class ElectrumXProvider(APIProvider):
         self.cert = cert if cert is not None else ELECTRUMX_CERT
         self.timeout = 30
         self.request_id = 0
-        self._connection_pool = None  # For future connection pooling
+        self._persistent_sock = None  # Persistent connection for reuse
         self._server_version = None  # Cached server version
+        self._last_logged_mb = 0  # For progress logging
+    
+    def _connect(self) -> bool:
+        """Establish a persistent connection to ElectrumX server"""
+        if self._persistent_sock is not None:
+            return True  # Already connected
+        
+        try:
+            if self.use_ssl and HAS_SSL:
+                print(f"[ELECTRUMX] Establishing persistent connection to {self.host}:{self.port} (SSL)...")
+                context = ssl.create_default_context()
+                if self.cert:
+                    context.load_verify_locations(self.cert)
+                else:
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(self.timeout)
+                sock.connect((self.host, self.port))
+                self._persistent_sock = context.wrap_socket(sock, server_hostname=self.host)
+            else:
+                print(f"[ELECTRUMX] Establishing persistent connection to {self.host}:{self.port} (TCP)...")
+                self._persistent_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._persistent_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._persistent_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self._persistent_sock.settimeout(self.timeout)
+                self._persistent_sock.connect((self.host, self.port))
+            
+            print(f"[ELECTRUMX] Persistent connection established")
+            return True
+        except Exception as e:
+            print(f"[ELECTRUMX] Failed to establish persistent connection: {e}")
+            self._persistent_sock = None
+            return False
+    
+    def _disconnect(self):
+        """Close the persistent connection"""
+        if self._persistent_sock:
+            try:
+                self._persistent_sock.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            try:
+                self._persistent_sock.close()
+            except:
+                pass
+            self._persistent_sock = None
+            self._server_version = None
+            print(f"[ELECTRUMX] Persistent connection closed")
     
     def _address_to_scripthash(self, address: str) -> Optional[str]:
         """
         Convert Bitcoin address to Electrum scripthash.
         Scripthash = SHA256(script) reversed, hex-encoded
         
-        For P2PKH addresses (starting with 1):
-        - Decode base58 to get hash160
-        - Create script: OP_DUP OP_HASH160 <hash160> OP_EQUALVERIFY OP_CHECKSIG
-        - SHA256 the script, reverse bytes, hex encode
+        Supports:
+        - P2PKH addresses (starting with 1): version byte 0x00
+        - P2SH addresses (starting with 3): version byte 0x05
+        - Bech32 addresses (starting with bc1): native SegWit
         """
         if not HAS_BASE58:
             return None
-            
+        
         try:
-            # Decode base58 address
+            # Handle Bech32 addresses (bc1...)
+            if address.startswith('bc1') or address.startswith('BC1'):
+                return self._bech32_to_scripthash(address)
+            
+            # Decode base58 address (P2PKH or P2SH)
             decoded = base58.b58decode(address)
             
-            # Extract the hash160 (20 bytes) from decoded address
             # Address format: version (1 byte) + hash160 (20 bytes) + checksum (4 bytes)
-            if len(decoded) >= 21:
-                hash160 = decoded[1:21]  # Skip version byte, take 20 bytes
-                
-                # Create script: OP_DUP OP_HASH160 <hash160> OP_EQUALVERIFY OP_CHECKSIG
-                # For P2PKH: 76a914<hash160>88ac
-                script_bytes = bytes([0x76, 0xa9, 0x14]) + hash160 + bytes([0x88, 0xac])
-                
-                # SHA256 of script
-                sha256_hash = hashlib.sha256(script_bytes).digest()
-                
-                # Reverse bytes and hex encode (Electrum format)
-                scripthash = sha256_hash[::-1].hex()
-                
-                return scripthash
-            else:
+            if len(decoded) < 21:
+                print(f"[ELECTRUMX] Invalid address length: {len(decoded)}")
                 return None
+            
+            version_byte = decoded[0]
+            hash160 = decoded[1:21]  # Skip version byte, take 20 bytes
+            
+            # Create script based on address type
+            if version_byte == 0x00:
+                # P2PKH (addresses starting with "1")
+                # Script: OP_DUP OP_HASH160 <hash160> OP_EQUALVERIFY OP_CHECKSIG
+                # Hex: 76a914<hash160>88ac
+                script_bytes = bytes([0x76, 0xa9, 0x14]) + hash160 + bytes([0x88, 0xac])
+            elif version_byte == 0x05:
+                # P2SH (addresses starting with "3")
+                # Script: OP_HASH160 <hash160> OP_EQUAL
+                # Hex: a914<hash160>87
+                script_bytes = bytes([0xa9, 0x14]) + hash160 + bytes([0x87])
+            else:
+                print(f"[ELECTRUMX] Unknown address version byte: {version_byte:#x}")
+                return None
+            
+            # SHA256 of script
+            sha256_hash = hashlib.sha256(script_bytes).digest()
+            
+            # Reverse bytes and hex encode (Electrum format)
+            scripthash = sha256_hash[::-1].hex()
+            
+            return scripthash
+            
         except Exception as e:
             print(f"[ELECTRUMX] Error converting address to scripthash: {e}")
             return None
+    
+    def _bech32_to_scripthash(self, address: str) -> Optional[str]:
+        """
+        Convert Bech32 (SegWit) address to Electrum scripthash.
+        
+        Supports:
+        - P2WPKH (bc1q...): 20-byte witness program
+        - P2WSH (bc1q... with 32-byte program): 32-byte witness program
+        """
+        try:
+            # Bech32 decoding
+            hrp = "bc"  # Bitcoin mainnet
+            address_lower = address.lower()
+            
+            if not address_lower.startswith(hrp + "1"):
+                print(f"[ELECTRUMX] Invalid bech32 prefix")
+                return None
+            
+            # Simple bech32 decode - extract the data part
+            CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+            data_part = address_lower[len(hrp) + 1:]  # Skip "bc1"
+            
+            # Convert from bech32 charset to 5-bit values
+            values = []
+            for char in data_part:
+                if char not in CHARSET:
+                    print(f"[ELECTRUMX] Invalid bech32 character: {char}")
+                    return None
+                values.append(CHARSET.index(char))
+            
+            # Remove checksum (last 6 characters)
+            values = values[:-6]
+            
+            if len(values) < 1:
+                return None
+            
+            # First value is witness version
+            witness_version = values[0]
+            
+            # Convert remaining 5-bit values to 8-bit bytes
+            acc = 0
+            bits = 0
+            witness_program = []
+            for value in values[1:]:
+                acc = (acc << 5) | value
+                bits += 5
+                while bits >= 8:
+                    bits -= 8
+                    witness_program.append((acc >> bits) & 0xff)
+            
+            witness_program = bytes(witness_program)
+            
+            # Create script based on witness program length
+            if len(witness_program) == 20:
+                # P2WPKH: OP_0 <20-byte-key-hash>
+                script_bytes = bytes([0x00, 0x14]) + witness_program
+            elif len(witness_program) == 32:
+                # P2WSH: OP_0 <32-byte-script-hash>
+                script_bytes = bytes([0x00, 0x20]) + witness_program
+            else:
+                print(f"[ELECTRUMX] Unexpected witness program length: {len(witness_program)}")
+                return None
+            
+            # SHA256 of script, reversed
+            sha256_hash = hashlib.sha256(script_bytes).digest()
+            scripthash = sha256_hash[::-1].hex()
+            
+            return scripthash
+            
+        except Exception as e:
+            print(f"[ELECTRUMX] Error converting bech32 address: {e}")
+            return None
+    
+    def _validate_jsonrpc_response(self, response: Dict[str, Any], expected_id: Optional[int] = None) -> Tuple[bool, Optional[str]]:
+        """
+        Validate JSON-RPC response structure (lenient validation for ElectrumX compatibility)
+        
+        Args:
+            response: Parsed JSON response
+            expected_id: Expected request ID (optional, not enforced since we use separate connections)
+        
+        Returns:
+            Tuple of (is_valid: bool, error_message: Optional[str])
+        """
+        if not isinstance(response, dict):
+            return False, "Response is not a dictionary"
+        
+        # Check for either result or error (main requirement)
+        has_result = "result" in response
+        has_error = "error" in response
+        
+        if not has_result and not has_error:
+            return False, "Response must contain either 'result' or 'error' field"
+        
+        # Validate error structure if present (lenient - just check it exists)
+        if has_error and response["error"] is not None:
+            error = response["error"]
+            if isinstance(error, dict):
+                # Standard error format - log if code/message missing but don't fail
+                if "message" not in error:
+                    error_msg = str(error)
+                    return True, None  # Still valid, just unusual format
+            # If error is a string or other type, that's okay too
+        
+        return True, None
+    
+    def _validate_transaction_format(self, tx: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+        """
+        Validate transaction has required fields for Mempool format
+        
+        Args:
+            tx: Transaction dictionary
+        
+        Returns:
+            Tuple of (is_valid: bool, error_message: Optional[str])
+        """
+        if not isinstance(tx, dict):
+            return False, "Transaction is not a dictionary"
+        
+        # Required fields
+        required_fields = ["txid", "hash", "status"]
+        for field in required_fields:
+            if field not in tx:
+                return False, f"Missing required field: {field}"
+        
+        # Validate status structure
+        status = tx.get("status")
+        if not isinstance(status, dict):
+            return False, "Status field must be a dictionary"
+        
+        # Validate vin/vout structure (should be lists)
+        if "vin" not in tx:
+            return False, "Missing 'vin' field"
+        if "vout" not in tx:
+            return False, "Missing 'vout' field"
+        
+        if not isinstance(tx["vin"], list):
+            return False, "vin must be a list"
+        if not isinstance(tx["vout"], list):
+            return False, "vout must be a list"
+        
+        # Validate vout entries have scriptpubkey_address
+        for idx, vout in enumerate(tx["vout"]):
+            if not isinstance(vout, dict):
+                return False, f"vout[{idx}] is not a dictionary"
+            # scriptpubkey_address is optional but preferred
+        
+        # Validate vin entries
+        for idx, vin in enumerate(tx["vin"]):
+            if not isinstance(vin, dict):
+                return False, f"vin[{idx}] is not a dictionary"
+            # prevout is optional but preferred
+        
+        return True, None
     
     async def _negotiate_version(self) -> bool:
         """Negotiate server version with ElectrumX server"""
@@ -336,8 +559,10 @@ class ElectrumXProvider(APIProvider):
             return False
     
     async def _send_request(self, method: str, params: list, timeout: Optional[int] = None, max_retries: int = 3) -> Dict[str, Any]:
-        """Send a JSON-RPC request to ElectrumX over TCP/SSL with improved response handling and retry logic"""
+        """Send a JSON-RPC request to ElectrumX over persistent connection"""
         self.request_id += 1
+        # Reset progress logging for this request
+        self._last_logged_mb = 0
         
         request = {
             "jsonrpc": "2.0",
@@ -350,56 +575,39 @@ class ElectrumXProvider(APIProvider):
         retry_delay = 2  # Start with 2 seconds
         
         for attempt in range(max_retries):
-            sock = None
-            sock = None
             try:
                 if attempt > 0:
                     print(f"[ELECTRUMX] Retry attempt {attempt + 1}/{max_retries}...")
                     await asyncio.sleep(retry_delay * attempt)  # Exponential backoff
+                    # Reconnect on retry
+                    self._disconnect()
                 
-                # Create socket with SSL support
-                if self.use_ssl and HAS_SSL:
-                    print(f"[ELECTRUMX] Connecting to {self.host}:{self.port} (SSL)...")
-                    # Create SSL context
-                    context = ssl.create_default_context()
-                    if self.cert:
-                        context.load_verify_locations(self.cert)
-                    else:
-                        context.check_hostname = False
-                        context.verify_mode = ssl.CERT_NONE
-                    
-                    # Create TCP socket first
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    sock.settimeout(request_timeout)
-                    sock.connect((self.host, self.port))
-                    # Wrap with SSL
-                    sock = context.wrap_socket(sock, server_hostname=self.host)
-                else:
-                    print(f"[ELECTRUMX] Connecting to {self.host}:{self.port} (TCP)...")
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    sock.settimeout(request_timeout)
-                    sock.connect((self.host, self.port))
+                # Ensure we have a persistent connection
+                if not self._connect():
+                    continue  # Retry
+                
+                sock = self._persistent_sock
+                sock.settimeout(request_timeout)
                 
                 # Send JSON-RPC request
                 message = json.dumps(request) + "\n"
                 sock.sendall(message.encode('utf-8'))
                 
                 # Read response - Electrum protocol uses newline-delimited JSON
-                # Read until we get a complete line (JSON object)
+                # Read until we get a complete line (JSON object ending with newline)
+                # Responses can be very large (5MB+), so we must read in chunks until newline
                 response_data = b""
                 buffer = b""
                 start_time = time.time()
+                max_response_size = 50 * 1024 * 1024  # 50MB safety limit
+                chunk_size = 65536  # 64KB chunks for efficiency
                 
                 while (time.time() - start_time) < request_timeout:
                     try:
                         sock.settimeout(2)  # Short timeout for each recv
-                        chunk = sock.recv(4096)
+                        chunk = sock.recv(chunk_size)
                         if not chunk:
-                            # Connection closed
+                            # Connection closed by server
                             break
                         
                         buffer += chunk
@@ -410,37 +618,53 @@ class ElectrumXProvider(APIProvider):
                             parts = buffer.split(b'\n', 1)
                             response_data = parts[0]
                             buffer = parts[1] if len(parts) > 1 else b""
+                            # Only log for larger responses or errors to reduce noise
+                            if len(response_data) > 10000 or b'"error"' in response_data:
+                                print(f"[ELECTRUMX] Received response: {len(response_data)} bytes")
                             break
                         
-                        # If buffer gets too large, something's wrong
-                        if len(buffer) > 100000:  # 100KB limit
-                            print("[ELECTRUMX] Response buffer too large, possible malformed response")
+                        # Safety check: prevent excessive memory usage
+                        if len(buffer) > max_response_size:
+                            print(f"[ELECTRUMX] Response exceeds maximum size ({max_response_size} bytes)")
+                            # Still try to find newline in what we have
+                            if b'\n' in buffer:
+                                parts = buffer.split(b'\n', 1)
+                                response_data = parts[0]
+                                buffer = parts[1] if len(parts) > 1 else b""
                             break
+                        
+                        # Log progress for very large responses (every 5MB, only once per increment)
+                        buffer_mb = len(buffer) / (1024 * 1024)
+                        last_logged_mb = getattr(self, '_last_logged_mb', 0)
+                        if buffer_mb >= 1 and buffer_mb >= last_logged_mb + 5:
+                            print(f"[ELECTRUMX] Reading large response: {buffer_mb:.1f} MB received, waiting for newline...")
+                            self._last_logged_mb = int((buffer_mb // 5) * 5)
                             
                     except socket.timeout:
-                        # If we have some data, try to use it
-                        if buffer:
-                            response_data = buffer
-                            buffer = b""
+                        # If we have data and found a newline, use it
+                        if buffer and b'\n' in buffer:
+                            parts = buffer.split(b'\n', 1)
+                            response_data = parts[0]
+                            buffer = parts[1] if len(parts) > 1 else b""
                             break
-                        # Continue waiting if no data yet
+                        # If we have data but no newline yet, continue waiting
+                        if buffer:
+                            # Continue waiting for more data (response is still being sent)
+                            continue
+                        # No data yet, continue waiting
                         continue
                 
-                # Properly close the connection
-                if sock:
-                    try:
-                        # Shutdown before close for clean connection termination
-                        if hasattr(sock, 'shutdown'):
-                            sock.shutdown(socket.SHUT_RDWR)
-                    except (OSError, socket.error):
-                        # Ignore errors if already closed
-                        pass
-                    finally:
-                        sock.close()
-                        sock = None
+                # If we exited the loop without finding newline but have data, check one more time
+                if not response_data and buffer and b'\n' in buffer:
+                    parts = buffer.split(b'\n', 1)
+                    response_data = parts[0]
+                
+                # Don't close the persistent connection - keep it open for reuse
                 
                 # Parse response
                 if not response_data:
+                    # Empty response may indicate connection issue - reconnect on retry
+                    self._disconnect()
                     if attempt < max_retries - 1:
                         print(f"[ELECTRUMX] Empty response, will retry...")
                         continue
@@ -449,15 +673,40 @@ class ElectrumXProvider(APIProvider):
                 
                 try:
                     response_text = response_data.decode('utf-8').strip()
+                    
+                    # Debug: Check if response looks valid
+                    if not response_text.startswith('{'):
+                        print(f"[ELECTRUMX] WARNING: Response doesn't start with '{{': {response_text[:200]}")
+                    
+                    # Debug: Log first bad response to understand the issue
+                    if len(response_text) < 100 and '"error"' not in response_text and '"result"' not in response_text:
+                        print(f"[ELECTRUMX] DEBUG: Short/unusual response for {method}: {response_text[:500]}")
+                    
                     response = json.loads(response_text)
                     
-                    if "error" in response and response["error"]:
-                        error_msg = response["error"].get("message", str(response["error"]))
-                        # Don't retry on RPC errors (they're not transient)
-                        print(f"[ELECTRUMX] RPC error: {error_msg}")
+                    # Validate JSON-RPC response structure
+                    is_valid, validation_error = self._validate_jsonrpc_response(response, self.request_id)
+                    if not is_valid:
+                        if attempt < max_retries - 1:
+                            print(f"[ELECTRUMX] Invalid JSON-RPC response, will retry: {validation_error}")
+                            continue
+                        print(f"[ELECTRUMX] Invalid JSON-RPC response: {validation_error}")
+                        print(f"[ELECTRUMX] Response was: {response_text[:200]}")
                         return {}
                     
-                    return response.get("result", {})
+                    # Check for error response
+                    if "error" in response and response["error"]:
+                        error_data = response["error"]
+                        error_code = error_data.get("code", "unknown")
+                        error_msg = error_data.get("message", str(error_data))
+                        # Don't retry on RPC errors (they're not transient)
+                        print(f"[ELECTRUMX] RPC error [{error_code}]: {error_msg}")
+                        return {}
+                    
+                    # Return result
+                    result = response.get("result", {})
+                    return result
+                    
                 except json.JSONDecodeError as e:
                     if attempt < max_retries - 1:
                         print(f"[ELECTRUMX] JSON decode error, will retry: {e}")
@@ -467,39 +716,30 @@ class ElectrumXProvider(APIProvider):
                     return {}
             
             except socket.timeout:
-                if sock:
-                    try:
-                        if hasattr(sock, 'shutdown'):
-                            sock.shutdown(socket.SHUT_RDWR)
-                    except:
-                        pass
-                    sock.close()
+                # Connection may be stale, force reconnect on retry
+                self._disconnect()
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Socket timeout, will retry...")
                     continue
                 print(f"[ELECTRUMX] Socket timeout after {request_timeout}s (all retries exhausted)")
                 return {}
             except ConnectionRefusedError:
-                if sock:
-                    try:
-                        if hasattr(sock, 'shutdown'):
-                            sock.shutdown(socket.SHUT_RDWR)
-                    except:
-                        pass
-                    sock.close()
+                self._disconnect()
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Connection refused, will retry...")
                     continue
                 print(f"[ELECTRUMX] Connection refused to {self.host}:{self.port}")
                 return {}
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                # Connection lost, force reconnect on retry
+                self._disconnect()
+                if attempt < max_retries - 1:
+                    print(f"[ELECTRUMX] Connection lost, will retry: {str(e)[:50]}")
+                    continue
+                print(f"[ELECTRUMX] Connection error: {str(e)[:100]}")
+                return {}
             except Exception as e:
-                if sock:
-                    try:
-                        if hasattr(sock, 'shutdown'):
-                            sock.shutdown(socket.SHUT_RDWR)
-                    except:
-                        pass
-                    sock.close()
+                self._disconnect()
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Error (will retry): {str(e)[:100]}")
                     continue
@@ -668,20 +908,41 @@ class ElectrumXProvider(APIProvider):
             
             # Step 3: Fetch full transaction details for each
             transactions = []
+            debug_logged = False  # Log first transaction for debugging
             for idx, (tx_hash, height) in enumerate(tx_hashes_to_fetch):
                 try:
                     # Fetch full transaction using blockchain.transaction.get
-                    # Try with verbose parameter first (ElectrumX supports this)
-                    # If that fails, try without verbose (returns hex, which we can't parse)
+                    # verbose=True returns parsed JSON, verbose=False returns raw hex
                     tx_data = await self._send_request("blockchain.transaction.get", [tx_hash, True])
                     
-                    # If that returns empty or error, try without verbose flag
-                    if not tx_data or (isinstance(tx_data, str) and len(tx_data) < 100):
+                    # Debug: Log first transaction response to verify format
+                    if not debug_logged and tx_data:
+                        print(f"[ELECTRUMX] DEBUG: First tx response type: {type(tx_data).__name__}")
+                        if isinstance(tx_data, dict):
+                            print(f"[ELECTRUMX] DEBUG: First tx keys: {list(tx_data.keys())[:10]}")
+                        elif isinstance(tx_data, str):
+                            print(f"[ELECTRUMX] DEBUG: First tx (hex): {tx_data[:100]}...")
+                        debug_logged = True
+                    
+                    # If verbose mode returned hex string or empty, we can't parse addresses
+                    # ElectrumX with verbose=True should return a dict with transaction details
+                    if not tx_data:
+                        # Try without verbose flag (returns hex)
                         tx_data = await self._send_request("blockchain.transaction.get", [tx_hash])
+                        if tx_data and isinstance(tx_data, str):
+                            # Got hex string - we can't extract addresses from this
+                            tx_data = None  # Will use fallback
                     
                     if tx_data:
                         # Convert to Mempool format
                         tx_obj = self._convert_electrum_tx_to_mempool_format(tx_data, tx_hash, height)
+                        
+                        # Validate transaction format
+                        is_valid, validation_error = self._validate_transaction_format(tx_obj)
+                        if not is_valid:
+                            print(f"[ELECTRUMX] Warning: Transaction format validation failed for {tx_hash[:16]}...: {validation_error}")
+                            # Still add it, but log the warning
+                        
                         transactions.append(tx_obj)
                     else:
                         # Fallback: create minimal transaction object
@@ -694,9 +955,11 @@ class ElectrumXProvider(APIProvider):
                             "vout": []
                         })
                     
-                    # Small delay to avoid overwhelming ElectrumX (every 10th transaction)
+                    # Progress logging and small delay to avoid overwhelming ElectrumX
+                    if (idx + 1) % 100 == 0:
+                        print(f"[ELECTRUMX] Progress: {idx + 1}/{len(tx_hashes_to_fetch)} transactions fetched")
                     if (idx + 1) % 10 == 0:
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.05)  # Small delay every 10 transactions
                     
                 except Exception as e:
                     print(f"[ELECTRUMX] Error fetching transaction {tx_hash[:16]}...: {str(e)[:50]}")
@@ -761,8 +1024,8 @@ class ElectrumXProvider(APIProvider):
             raise
     
     async def close(self):
-        """Cleanup"""
-        pass
+        """Cleanup - close the persistent connection"""
+        self._disconnect()
 
 
 def get_provider(provider_name: str = None, api_key: str = None) -> APIProvider:

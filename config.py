@@ -46,6 +46,13 @@ ELECTRUMX_PORT = int(os.getenv("ELECTRUMX_PORT", "50001"))
 ELECTRUMX_USE_SSL = os.getenv("ELECTRUMX_USE_SSL", "false").lower() == "true"
 ELECTRUMX_CERT = os.getenv("ELECTRUMX_CERT", None)  # Optional: path to SSL certificate
 
+# SSH Configuration for ElectrumX log access
+SSH_HOST = os.getenv("SSH_HOST", None)  # SSH server hostname/IP (may differ from ELECTRUMX_HOST)
+SSH_USER = os.getenv("SSH_USER", None)  # SSH username
+SSH_KEY_PATH = os.getenv("SSH_KEY_PATH", None)  # Optional: path to SSH private key
+SSH_PORT = int(os.getenv("SSH_PORT", "22"))  # SSH port
+ELECTRUMX_DOCKER_CONTAINER = os.getenv("ELECTRUMX_DOCKER_CONTAINER", "electrumx")  # Docker container name
+
 # Legacy electrs config (deprecated - will be removed)
 ELECTRS_LOCAL_URL = "tcp://100.94.34.56:50001"  # Deprecated
 ELECTRS_HOST = "100.94.34.56"  # Deprecated
