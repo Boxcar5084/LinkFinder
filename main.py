@@ -89,6 +89,10 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
         sessions[session_id]['status'] = 'running'
         
         api = get_provider(DEFAULT_API)
+        
+        # Open connection at the start of search
+        if hasattr(api, 'open'):
+            await api.open()
 
         # Create wrapper linker that updates trace state for checkpointing
         checkpoint_state = sessions[session_id].get('checkpoint_state')
@@ -240,6 +244,13 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
 
         print(f"[SAVE] Checkpoint saved on cancel: {checkpoint_id}")
         print(f" Addresses examined: {checkpoint_data['progress']['addresses_examined']}")
+        
+        # Close connection on cancellation
+        try:
+            if 'api' in locals():
+                await api.close()
+        except Exception as close_err:
+            print(f"[WARN] Error closing connection on cancel: {close_err}")
 
     except Exception as e:
         print(f"[ERR] Session {session_id} failed: {e}")
@@ -255,6 +266,13 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
             'failed_at': datetime.now().isoformat(),
             'task': None  # Clear task reference
         })
+        
+        # Close connection on error
+        try:
+            if 'api' in locals():
+                await api.close()
+        except Exception as close_err:
+            print(f"[WARN] Error closing connection on error: {close_err}")
 
 # CORRECTED _periodic_checkpoint_task function for main.py
 

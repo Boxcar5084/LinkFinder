@@ -81,6 +81,9 @@ EXCHANGE_WALLET_THRESHOLD = int(os.getenv("EXCHANGE_WALLET_THRESHOLD", "1000")) 
 MAX_INPUT_ADDRESSES_PER_TX = int(os.getenv("MAX_INPUT_ADDRESSES_PER_TX", "50"))  # Maximum input addresses to process per transaction (prevents queue flooding)
 MAX_OUTPUT_ADDRESSES_PER_TX = int(os.getenv("MAX_OUTPUT_ADDRESSES_PER_TX", "50"))  # Maximum output addresses to process per transaction (prevents queue flooding)
 
+# Large transaction filtering
+MAX_TRANSACTION_SIZE_MB = float(os.getenv("MAX_TRANSACTION_SIZE_MB", "1.0"))  # Maximum transaction size in MB before skipping (default: 1MB)
+
 # Cache management
 CACHE_MAX_SIZE_MB = 2048           # Maximum cache size in MB
 CACHE_PRUNE_TARGET = 0.7           # Prune to 70% of max (leaves 30% buffer)

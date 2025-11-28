@@ -256,20 +256,29 @@ def main():
     print(f"  Using actual provider to test connection...")
     
     protocol_success = False
+    provider = None
     try:
         from api_provider import get_provider
         provider = get_provider("electrumx")
         
-        # Try a simple server.version call first (doesn't need blockchain data)
-        # This is a bit tricky since we need to access internal methods
-        # Instead, let's just test if we can connect and get a response
-        print(f"    Testing connection to {ELECTRUMX_HOST}:{ELECTRUMX_PORT}...")
-        
-        # Use a simple address with few transactions for testing
-        # (Genesis address has 54k+ transactions which takes too long)
-        test_address = "38YEkk8pKA1DXWhQTdW53ibXUaFDYqk269" #"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"  # Small address for testing
-        print(f"    Testing with address: {test_address}")
-        txs = asyncio.run(provider.get_address_transactions(test_address))
+        # Open connection explicitly at the start
+        if hasattr(provider, 'open'):
+            async def test_connection():
+                await provider.open()
+                return await provider.get_address_transactions(test_address)
+            
+            # Use a simple address with few transactions for testing
+            # (Genesis address has 54k+ transactions which takes too long)
+            test_address = "38YEkk8pKA1DXWhQTdW53ibXUaFDYqk269" #"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"  # Small address for testing
+            print(f"    Testing connection to {ELECTRUMX_HOST}:{ELECTRUMX_PORT}...")
+            print(f"    Testing with address: {test_address}")
+            txs = asyncio.run(test_connection())
+        else:
+            # Fallback for providers without open() method
+            test_address = "38YEkk8pKA1DXWhQTdW53ibXUaFDYqk269"
+            print(f"    Testing connection to {ELECTRUMX_HOST}:{ELECTRUMX_PORT}...")
+            print(f"    Testing with address: {test_address}")
+            txs = asyncio.run(provider.get_address_transactions(test_address))
         
         # If we get here without exception, connection works
         protocol_success = True
@@ -280,11 +289,17 @@ def main():
             print(f"  ✓ SUCCESS - Connection established")
             print(f"    (Server responded but returned None - may still be syncing)")
         
-        asyncio.run(provider.close())
     except Exception as e:
         print(f"  ✗ FAILED - Could not establish connection")
         print(f"    Error: {e}")
         protocol_success = False
+    finally:
+        # Ensure connection is closed
+        if provider is not None:
+            try:
+                asyncio.run(provider.close())
+            except Exception as close_err:
+                print(f"    Warning: Error closing connection: {close_err}")
     
     # Also try the simple socket test for comparison
     print(f"\n[TEST 3b] Testing raw socket protocol...")
@@ -319,39 +334,49 @@ def main():
     parsing_details = None
     
     if protocol_success:
+        provider = None
         try:
             from api_provider import get_provider, ElectrumXProvider
             provider = get_provider("electrumx")
             
-            # Test direct transaction fetch with a known tx hash
-            # This tests the blockchain.transaction.get method directly
-            print(f"    Testing direct transaction fetch...")
-            known_tx = "065f3cf51e45fff9063ebc50deb2af5e24b1817020e4de19a782eafee90f5b4e" #"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"  # Genesis coinbase tx
+            async def test_parsing():
+                # Open connection explicitly
+                if hasattr(provider, 'open'):
+                    await provider.open()
+                
+                # Test direct transaction fetch with a known tx hash
+                # This tests the blockchain.transaction.get method directly
+                print(f"    Testing direct transaction fetch...")
+                known_tx = "065f3cf51e45fff9063ebc50deb2af5e24b1817020e4de19a782eafee90f5b4e" #"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"  # Genesis coinbase tx
+                
+                tx_fetch_success = False
+                # Use internal method to test transaction fetch directly
+                if isinstance(provider, ElectrumXProvider):
+                    tx_result = await provider._send_request("blockchain.transaction.get", [known_tx, True])
+                    if tx_result:
+                        print(f"    ✓ Direct transaction fetch succeeded")
+                        print(f"      Response type: {type(tx_result).__name__}")
+                        if isinstance(tx_result, dict):
+                            print(f"      Keys: {list(tx_result.keys())[:8]}")
+                            if "vin" in tx_result and "vout" in tx_result:
+                                print(f"      Has vin: {len(tx_result.get('vin', []))} inputs")
+                                print(f"      Has vout: {len(tx_result.get('vout', []))} outputs")
+                                tx_fetch_success = True
+                            else:
+                                print(f"      ⚠️ Response missing vin/vout - may be hex format")
+                        elif isinstance(tx_result, str):
+                            print(f"      Response is hex string ({len(tx_result)} chars)")
+                            print(f"      ⚠️ verbose=True returned hex instead of dict")
+                    else:
+                        print(f"    ✗ Direct transaction fetch returned empty")
+                
+                # Also test full address query with small address
+                print(f"    Testing address transaction history...")
+                test_address = "38YEkk8pKA1DXWhQTdW53ibXUaFDYqk269" #"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"  # Small address
+                txs = await provider.get_address_transactions(test_address)
+                return txs, tx_fetch_success
             
-            # Use internal method to test transaction fetch directly
-            if isinstance(provider, ElectrumXProvider):
-                tx_result = asyncio.run(provider._send_request("blockchain.transaction.get", [known_tx, True]))
-                if tx_result:
-                    print(f"    ✓ Direct transaction fetch succeeded")
-                    print(f"      Response type: {type(tx_result).__name__}")
-                    if isinstance(tx_result, dict):
-                        print(f"      Keys: {list(tx_result.keys())[:8]}")
-                        if "vin" in tx_result and "vout" in tx_result:
-                            print(f"      Has vin: {len(tx_result.get('vin', []))} inputs")
-                            print(f"      Has vout: {len(tx_result.get('vout', []))} outputs")
-                            parsing_success = True
-                        else:
-                            print(f"      ⚠️ Response missing vin/vout - may be hex format")
-                    elif isinstance(tx_result, str):
-                        print(f"      Response is hex string ({len(tx_result)} chars)")
-                        print(f"      ⚠️ verbose=True returned hex instead of dict")
-                else:
-                    print(f"    ✗ Direct transaction fetch returned empty")
-            
-            # Also test full address query with small address
-            print(f"    Testing address transaction history...")
-            test_address = "38YEkk8pKA1DXWhQTdW53ibXUaFDYqk269" #"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"  # Small address
-            txs = asyncio.run(provider.get_address_transactions(test_address))
+            txs, tx_fetch_success = asyncio.run(test_parsing())
             
             if txs is not None:
                 if len(txs) > 0:
@@ -379,11 +404,17 @@ def main():
             else:
                 print(f"  ⚠️  Provider returned None (may indicate connection issue)")
             
-            asyncio.run(provider.close())
         except Exception as e:
             import traceback
             print(f"  ✗ Transaction parsing test failed: {e}")
             traceback.print_exc()
+        finally:
+            # Ensure connection is closed
+            if provider is not None:
+                try:
+                    asyncio.run(provider.close())
+                except Exception as close_err:
+                    print(f"    Warning: Error closing connection: {close_err}")
     else:
         print(f"  - Skipped (protocol test failed)")
     

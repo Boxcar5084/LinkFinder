@@ -5,7 +5,15 @@ import time
 import hashlib
 from typing import List, Dict, Optional, Any
 from abc import ABC, abstractmethod
-from config import DEFAULT_API, MEMPOOL_API_KEY
+from config import (
+    DEFAULT_API, 
+    MEMPOOL_API_KEY,
+    MAX_TRANSACTION_SIZE_MB,
+    SKIP_MIXER_INPUT_THRESHOLD,
+    SKIP_MIXER_OUTPUT_THRESHOLD,
+    SKIP_DISTRIBUTION_MAX_INPUTS,
+    SKIP_DISTRIBUTION_MIN_OUTPUTS
+)
 import socket
 import json
 
@@ -285,8 +293,10 @@ class ElectrumXProvider(APIProvider):
             return True  # Already connected
         
         try:
+            # Use same simple socket setup as test_connectivity.py (which works)
+            # Note: Don't use persistent connections with ElectrumX - create fresh for each request
             if self.use_ssl and HAS_SSL:
-                print(f"[ELECTRUMX] Establishing persistent connection to {self.host}:{self.port} (SSL)...")
+                print(f"[ELECTRUMX] Establishing connection to {self.host}:{self.port} (SSL)...")
                 context = ssl.create_default_context()
                 if self.cert:
                     context.load_verify_locations(self.cert)
@@ -295,40 +305,33 @@ class ElectrumXProvider(APIProvider):
                     context.verify_mode = ssl.CERT_NONE
                 
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock.settimeout(self.timeout)
                 sock.connect((self.host, self.port))
                 self._persistent_sock = context.wrap_socket(sock, server_hostname=self.host)
             else:
-                print(f"[ELECTRUMX] Establishing persistent connection to {self.host}:{self.port} (TCP)...")
+                print(f"[ELECTRUMX] Establishing connection to {self.host}:{self.port} (TCP)...")
                 self._persistent_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._persistent_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self._persistent_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self._persistent_sock.settimeout(self.timeout)
                 self._persistent_sock.connect((self.host, self.port))
             
-            print(f"[ELECTRUMX] Persistent connection established")
             return True
         except Exception as e:
             print(f"[ELECTRUMX] Failed to establish persistent connection: {e}")
             self._persistent_sock = None
             return False
     
+    async def open(self):
+        """Initialize provider (connections are created per-request for reliability)"""
+        print(f"[ELECTRUMX] Provider ready for {self.host}:{self.port}")
+        return True
+    
+    async def close(self):
+        """Cleanup provider (connections are closed per-request automatically)"""
+        print(f"[ELECTRUMX] Provider closed")
+    
     def _disconnect(self):
-        """Close the persistent connection"""
-        if self._persistent_sock:
-            try:
-                self._persistent_sock.shutdown(socket.SHUT_RDWR)
-            except:
-                pass
-            try:
-                self._persistent_sock.close()
-            except:
-                pass
-            self._persistent_sock = None
-            self._server_version = None
-            print(f"[ELECTRUMX] Persistent connection closed")
+        """Close the persistent connection (legacy, kept for compatibility)"""
+        pass
     
     def _address_to_scripthash(self, address: str) -> Optional[str]:
         """
@@ -579,38 +582,80 @@ class ElectrumXProvider(APIProvider):
                 if attempt > 0:
                     print(f"[ELECTRUMX] Retry attempt {attempt + 1}/{max_retries}...")
                     await asyncio.sleep(retry_delay * attempt)  # Exponential backoff
-                    # Reconnect on retry
-                    self._disconnect()
-                
-                # Ensure we have a persistent connection
-                if not self._connect():
+                # Create a fresh socket for each request (ElectrumX closes idle connections quickly)
+                # This matches how test_connectivity.py works - create socket, send, receive, close
+                sock = None
+                try:
+                    if self.use_ssl and HAS_SSL:
+                        context = ssl.create_default_context()
+                        if self.cert:
+                            context.load_verify_locations(self.cert)
+                        else:
+                            context.check_hostname = False
+                            context.verify_mode = ssl.CERT_NONE
+                        
+                        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        raw_sock.settimeout(self.timeout)
+                        raw_sock.connect((self.host, self.port))
+                        sock = context.wrap_socket(raw_sock, server_hostname=self.host)
+                    else:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(self.timeout)
+                        sock.connect((self.host, self.port))
+                except Exception as e:
+                    if attempt == 0:
+                        print(f"[ELECTRUMX] Connection failed: {e}")
+                    if sock:
+                        try:
+                            sock.close()
+                        except:
+                            pass
                     continue  # Retry
                 
-                sock = self._persistent_sock
-                sock.settimeout(request_timeout)
-                
-                # Send JSON-RPC request
+                # Send JSON-RPC request - use exact same format as working test_connectivity.py
                 message = json.dumps(request) + "\n"
-                sock.sendall(message.encode('utf-8'))
+                
+                # Debug: Log what we're sending
+                if attempt == 0:  # Only log on first attempt to reduce noise
+                    print(f"[ELECTRUMX] Sending request: {method} (id={self.request_id})")
+                
+                try:
+                    # Send immediately (like test_connectivity.py)
+                    sock.sendall(message.encode('utf-8'))
+                except (BrokenPipeError, OSError) as e:
+                    if attempt == 0:
+                        print(f"[ELECTRUMX] Error sending request: {e}")
+                    try:
+                        sock.close()
+                    except:
+                        pass
+                    continue  # Retry
                 
                 # Read response - Electrum protocol uses newline-delimited JSON
                 # Read until we get a complete line (JSON object ending with newline)
-                # Responses can be very large (5MB+), so we must read in chunks until newline
+                # Use EXACT same approach as test_connectivity.py which works
                 response_data = b""
                 buffer = b""
                 start_time = time.time()
                 max_response_size = 50 * 1024 * 1024  # 50MB safety limit
-                chunk_size = 65536  # 64KB chunks for efficiency
+                chunk_size = 4096  # Same as test_connectivity.py
+                read_timeout = 10  # Same as test_connectivity.py
                 
-                while (time.time() - start_time) < request_timeout:
+                while (time.time() - start_time) < read_timeout:
                     try:
-                        sock.settimeout(2)  # Short timeout for each recv
+                        sock.settimeout(2)  # Same 2s timeout as test_connectivity.py
                         chunk = sock.recv(chunk_size)
                         if not chunk:
                             # Connection closed by server
+                            if attempt == 0:
+                                print(f"[ELECTRUMX] Server closed connection during read for {method}")
                             break
                         
                         buffer += chunk
+                        
+                        # Debug: Log first chunk received
+                        if attempt == 0 and len(buffer) == len(chunk):
+                            print(f"[ELECTRUMX] Received first chunk: {len(chunk)} bytes for {method}")
                         
                         # Check if we have a complete line (newline-delimited JSON)
                         if b'\n' in buffer:
@@ -618,9 +663,8 @@ class ElectrumXProvider(APIProvider):
                             parts = buffer.split(b'\n', 1)
                             response_data = parts[0]
                             buffer = parts[1] if len(parts) > 1 else b""
-                            # Only log for larger responses or errors to reduce noise
-                            if len(response_data) > 10000 or b'"error"' in response_data:
-                                print(f"[ELECTRUMX] Received response: {len(response_data)} bytes")
+                            if attempt == 0:
+                                print(f"[ELECTRUMX] Received complete response: {len(response_data)} bytes for {method}")
                             break
                         
                         # Safety check: prevent excessive memory usage
@@ -632,43 +676,52 @@ class ElectrumXProvider(APIProvider):
                                 response_data = parts[0]
                                 buffer = parts[1] if len(parts) > 1 else b""
                             break
-                        
-                        # Log progress for very large responses (every 5MB, only once per increment)
-                        buffer_mb = len(buffer) / (1024 * 1024)
-                        last_logged_mb = getattr(self, '_last_logged_mb', 0)
-                        if buffer_mb >= 1 and buffer_mb >= last_logged_mb + 5:
-                            print(f"[ELECTRUMX] Reading large response: {buffer_mb:.1f} MB received, waiting for newline...")
-                            self._last_logged_mb = int((buffer_mb // 5) * 5)
                             
                     except socket.timeout:
-                        # If we have data and found a newline, use it
-                        if buffer and b'\n' in buffer:
-                            parts = buffer.split(b'\n', 1)
-                            response_data = parts[0]
-                            buffer = parts[1] if len(parts) > 1 else b""
-                            break
-                        # If we have data but no newline yet, continue waiting
+                        # If we have some data, try to use it (like test_connectivity.py)
                         if buffer:
-                            # Continue waiting for more data (response is still being sent)
-                            continue
+                            # Check if we have a newline now
+                            if b'\n' in buffer:
+                                parts = buffer.split(b'\n', 1)
+                                response_data = parts[0]
+                                buffer = parts[1] if len(parts) > 1 else b""
+                                if attempt == 0:
+                                    print(f"[ELECTRUMX] Received response on timeout: {len(response_data)} bytes for {method}")
+                                break
+                            # If we have data but no newline, use it anyway (like test_connectivity.py)
+                            response_data = buffer
+                            buffer = b""
+                            if attempt == 0:
+                                print(f"[ELECTRUMX] Using incomplete response: {len(response_data)} bytes for {method}")
+                            break
                         # No data yet, continue waiting
+                        elapsed = time.time() - start_time
+                        if attempt == 0 and elapsed > 2.0:
+                            print(f"[ELECTRUMX] Still waiting for response for {method} (elapsed: {elapsed:.1f}s)")
                         continue
+                    except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                        if attempt == 0:
+                            print(f"[ELECTRUMX] Connection error during read for {method}: {e}")
+                        break
                 
-                # If we exited the loop without finding newline but have data, check one more time
-                if not response_data and buffer and b'\n' in buffer:
-                    parts = buffer.split(b'\n', 1)
-                    response_data = parts[0]
+                # If we exited the loop without finding newline but have data, use it
+                if not response_data and buffer:
+                    response_data = buffer
+                    if attempt == 0:
+                        print(f"[ELECTRUMX] Using buffer data after loop: {len(response_data)} bytes for {method}")
                 
-                # Don't close the persistent connection - keep it open for reuse
+                # Close socket after request (like test_connectivity.py)
+                try:
+                    sock.close()
+                except:
+                    pass
                 
                 # Parse response
                 if not response_data:
-                    # Empty response may indicate connection issue - reconnect on retry
-                    self._disconnect()
                     if attempt < max_retries - 1:
-                        print(f"[ELECTRUMX] Empty response, will retry...")
+                        print(f"[ELECTRUMX] Empty response for {method}, will retry...")
                         continue
-                    print("[ELECTRUMX] Empty response from server after retries")
+                    print(f"[ELECTRUMX] Empty response from server after retries for {method}")
                     return {}
                 
                 try:
@@ -716,30 +769,45 @@ class ElectrumXProvider(APIProvider):
                     return {}
             
             except socket.timeout:
-                # Connection may be stale, force reconnect on retry
-                self._disconnect()
+                # Ensure socket is closed
+                if sock:
+                    try:
+                        sock.close()
+                    except:
+                        pass
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Socket timeout, will retry...")
                     continue
                 print(f"[ELECTRUMX] Socket timeout after {request_timeout}s (all retries exhausted)")
                 return {}
             except ConnectionRefusedError:
-                self._disconnect()
+                if sock:
+                    try:
+                        sock.close()
+                    except:
+                        pass
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Connection refused, will retry...")
                     continue
                 print(f"[ELECTRUMX] Connection refused to {self.host}:{self.port}")
                 return {}
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
-                # Connection lost, force reconnect on retry
-                self._disconnect()
+                if sock:
+                    try:
+                        sock.close()
+                    except:
+                        pass
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Connection lost, will retry: {str(e)[:50]}")
                     continue
                 print(f"[ELECTRUMX] Connection error: {str(e)[:100]}")
                 return {}
             except Exception as e:
-                self._disconnect()
+                if sock:
+                    try:
+                        sock.close()
+                    except:
+                        pass
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Error (will retry): {str(e)[:100]}")
                     continue
@@ -748,6 +816,54 @@ class ElectrumXProvider(APIProvider):
         
         # All retries exhausted
         return {}
+    
+    def _should_skip_large_transaction(self, tx_data: Any, response_size_bytes: int = 0) -> bool:
+        """
+        Check if a transaction should be skipped based on size or input/output counts.
+        This prevents wasting resources on large transactions that would be filtered anyway.
+        
+        Args:
+            tx_data: Raw transaction data from ElectrumX (dict or str)
+            response_size_bytes: Size of the response in bytes (if available)
+        
+        Returns:
+            True if transaction should be skipped, False otherwise
+        """
+        # Check response size if available
+        if response_size_bytes > 0:
+            size_mb = response_size_bytes / (1024 * 1024)
+            if size_mb > MAX_TRANSACTION_SIZE_MB:
+                print(f"[ELECTRUMX] Skipping large transaction: {size_mb:.2f} MB (threshold: {MAX_TRANSACTION_SIZE_MB} MB)")
+                return True
+        
+        # Check input/output counts if tx_data is a dict
+        if isinstance(tx_data, dict):
+            # Try to get input/output counts from various possible formats
+            inputs_count = 0
+            outputs_count = 0
+            
+            # Check for vin/vout (Mempool format)
+            if "vin" in tx_data:
+                inputs_count = len(tx_data["vin"])
+            elif "inputs" in tx_data:
+                inputs_count = len(tx_data["inputs"])
+            
+            if "vout" in tx_data:
+                outputs_count = len(tx_data["vout"])
+            elif "outputs" in tx_data:
+                outputs_count = len(tx_data["outputs"])
+            
+            # FILTER 1: Extreme mixers (both sides massive)
+            if inputs_count >= SKIP_MIXER_INPUT_THRESHOLD and outputs_count >= SKIP_MIXER_OUTPUT_THRESHOLD:
+                print(f"[ELECTRUMX] Skipping extreme mixer: {inputs_count} in → {outputs_count} out")
+                return True
+            
+            # FILTER 2: Distribution/Airdrop transactions (CRITICAL!)
+            if inputs_count <= SKIP_DISTRIBUTION_MAX_INPUTS and outputs_count >= SKIP_DISTRIBUTION_MIN_OUTPUTS:
+                print(f"[ELECTRUMX] Skipping airdrop/distribution: {inputs_count} in → {outputs_count} out")
+                return True
+        
+        return False
     
     def _convert_electrum_tx_to_mempool_format(self, tx_data: Any, tx_hash: str, height: int) -> Dict[str, Any]:
         """
@@ -869,9 +985,7 @@ class ElectrumXProvider(APIProvider):
         """Fetch transactions from ElectrumX using Electrum protocol with full transaction details"""
         
         try:
-            # Negotiate version on first connection
-            if self._server_version is None:
-                await self._negotiate_version()
+            # Note: Version negotiation is optional for ElectrumX - removed to avoid connection issues
             
             # Convert address to scripthash
             scripthash = self._address_to_scripthash(address)
@@ -930,10 +1044,18 @@ class ElectrumXProvider(APIProvider):
                         # Try without verbose flag (returns hex)
                         tx_data = await self._send_request("blockchain.transaction.get", [tx_hash])
                         if tx_data and isinstance(tx_data, str):
+                            # Got hex string - check size before processing
+                            hex_size = len(tx_data.encode('utf-8')) if isinstance(tx_data, str) else 0
+                            if self._should_skip_large_transaction(tx_data, hex_size):
+                                continue  # Skip this transaction
                             # Got hex string - we can't extract addresses from this
                             tx_data = None  # Will use fallback
                     
                     if tx_data:
+                        # Check if transaction should be skipped before converting (saves resources)
+                        if self._should_skip_large_transaction(tx_data):
+                            continue  # Skip this transaction
+                        
                         # Convert to Mempool format
                         tx_obj = self._convert_electrum_tx_to_mempool_format(tx_data, tx_hash, height)
                         
