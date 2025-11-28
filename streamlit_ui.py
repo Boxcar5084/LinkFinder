@@ -8,7 +8,7 @@ from datetime import datetime
 import time
 import socket
 import json
-from config import EXPORT_DIR
+from config import EXPORT_DIR, MAX_DEPTH
 
 # Check for dialog support (Streamlit 1.34+)
 if hasattr(st, "dialog"):
@@ -690,11 +690,22 @@ with tab1:
                         with col1:
                             st.metric("Max Depth", request_info.get('max_depth', 'N/A'))
                         with col2:
-                            start_block = request_info.get('start_block')
-                            st.metric("Start Block", start_block if start_block else "None")
+                            # Show effective block range if available, otherwise fall back to request
+                            block_range_info = details.get('block_range', {})
+                            if block_range_info and block_range_info.get('effective_start_block') is not None:
+                                effective_start = block_range_info.get('effective_start_block')
+                                st.metric("Start Block", effective_start)
+                            else:
+                                start_block = request_info.get('start_block')
+                                st.metric("Start Block", start_block if start_block else "None")
                         with col3:
-                            end_block = request_info.get('end_block')
-                            st.metric("End Block", end_block if end_block else "None")
+                            # Show effective block range if available, otherwise fall back to request
+                            if block_range_info and block_range_info.get('effective_end_block') is not None:
+                                effective_end = block_range_info.get('effective_end_block')
+                                st.metric("End Block", effective_end)
+                            else:
+                                end_block = request_info.get('end_block')
+                                st.metric("End Block", end_block if end_block else "None")
                     
                     st.divider()
                     
@@ -794,7 +805,7 @@ with tab2:
     
     st.divider()
     
-    max_depth = 5
+    max_depth = min(5, MAX_DEPTH)  # Default to 5 or MAX_DEPTH if lower
     start_block = 0
     end_block = 999999999
     
@@ -802,7 +813,7 @@ with tab2:
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            max_depth = st.slider("Max Depth", 1, 10, 5)
+            max_depth = st.slider("Max Depth", 1, MAX_DEPTH, min(5, MAX_DEPTH))
         with col2:
             start_block = st.number_input("Start Block", 0, value=0)
         with col3:
@@ -1101,11 +1112,22 @@ with tab3:
                             with col1:
                                 st.metric("Max Depth", request_data.get('max_depth', 'N/A'))
                             with col2:
-                                start_block = request_data.get('start_block')
-                                st.metric("Start Block", start_block if start_block else "None")
+                                # Show effective block range if available from checkpoint, otherwise fall back to request
+                                block_range_info = cp_details.get('block_range', {})
+                                if block_range_info and block_range_info.get('effective_start_block') is not None:
+                                    effective_start = block_range_info.get('effective_start_block')
+                                    st.metric("Start Block", effective_start)
+                                else:
+                                    start_block = request_data.get('start_block')
+                                    st.metric("Start Block", start_block if start_block else "None")
                             with col3:
-                                end_block = request_data.get('end_block')
-                                st.metric("End Block", end_block if end_block else "None")
+                                # Show effective block range if available from checkpoint, otherwise fall back to request
+                                if block_range_info and block_range_info.get('effective_end_block') is not None:
+                                    effective_end = block_range_info.get('effective_end_block')
+                                    st.metric("End Block", effective_end)
+                                else:
+                                    end_block = request_data.get('end_block')
+                                    st.metric("End Block", end_block if end_block else "None")
                 
                     # Action buttons
                     st.divider()

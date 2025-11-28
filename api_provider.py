@@ -3,7 +3,7 @@ import requests
 import asyncio
 import time
 import hashlib
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 from abc import ABC, abstractmethod
 from config import (
     DEFAULT_API, 
@@ -14,7 +14,8 @@ from config import (
     SKIP_DISTRIBUTION_MAX_INPUTS,
     SKIP_DISTRIBUTION_MIN_OUTPUTS,
     MAX_TRANSACTIONS_PER_ADDRESS,
-    EXCHANGE_WALLET_THRESHOLD
+    EXCHANGE_WALLET_THRESHOLD,
+    ELECTRUMX_DEBUG
 )
 import socket
 import json
@@ -44,6 +45,16 @@ class APIProvider(ABC):
                                      start_block: Optional[int] = None,
                                      end_block: Optional[int] = None) -> List[Dict[str, Any]]:
         """Fetch transactions for an address"""
+        pass
+
+    @abstractmethod
+    async def get_address_block_range(self, address: str) -> Optional[Tuple[int, int]]:
+        """
+        Get the earliest and latest block heights for an address.
+        
+        Returns:
+            Tuple of (earliest_block, latest_block) or None if no confirmed transactions
+        """
         pass
 
     @abstractmethod
@@ -139,6 +150,42 @@ class BlockchainInfoProvider(APIProvider):
 
         print(f" [ERR] Max retries exceeded for {address}")
         return []
+
+    async def get_address_block_range(self, address: str) -> Optional[Tuple[int, int]]:
+        """
+        Get the earliest and latest block heights for an address.
+        Fetches transactions and extracts block heights.
+        
+        Returns:
+            Tuple of (earliest_block, latest_block) or None if no confirmed transactions
+        """
+        try:
+            # Fetch all transactions (no block filter)
+            txs = await self.get_address_transactions(address)
+            
+            if not txs:
+                return None
+            
+            # Extract confirmed block heights (blockchain.info format uses 'block_height')
+            heights = []
+            for tx in txs:
+                block_height = tx.get('block_height')
+                if block_height is not None and block_height > 0:
+                    heights.append(block_height)
+            
+            if not heights:
+                print(f"[BLOCKCHAIN] No confirmed transactions for {address}")
+                return None
+            
+            earliest = min(heights)
+            latest = max(heights)
+            
+            print(f"[BLOCKCHAIN] Block range for {address[:16]}...: {earliest} - {latest}")
+            return (earliest, latest)
+            
+        except Exception as e:
+            print(f"[BLOCKCHAIN] Error getting block range for {address}: {str(e)[:100]}")
+            return None
 
     async def close(self):
         """Cleanup"""
@@ -269,6 +316,42 @@ class MempoolProvider(APIProvider):
 
         print(f" [ERR] Max retries exceeded for {address}")
         return []
+
+    async def get_address_block_range(self, address: str) -> Optional[Tuple[int, int]]:
+        """
+        Get the earliest and latest block heights for an address.
+        Fetches transactions and extracts block heights.
+        
+        Returns:
+            Tuple of (earliest_block, latest_block) or None if no confirmed transactions
+        """
+        try:
+            # Fetch all transactions (no block filter)
+            txs = await self.get_address_transactions(address)
+            
+            if not txs:
+                return None
+            
+            # Extract confirmed block heights
+            heights = []
+            for tx in txs:
+                block_height = tx.get('status', {}).get('block_height')
+                if block_height is not None and block_height > 0:
+                    heights.append(block_height)
+            
+            if not heights:
+                print(f"[MEMPOOL] No confirmed transactions for {address}")
+                return None
+            
+            earliest = min(heights)
+            latest = max(heights)
+            
+            print(f"[MEMPOOL] Block range for {address[:16]}...: {earliest} - {latest}")
+            return (earliest, latest)
+            
+        except Exception as e:
+            print(f"[MEMPOOL] Error getting block range for {address}: {str(e)[:100]}")
+            return None
 
     async def close(self):
         """Cleanup"""
@@ -617,8 +700,8 @@ class ElectrumXProvider(APIProvider):
                 # Send JSON-RPC request - use exact same format as working test_connectivity.py
                 message = json.dumps(request) + "\n"
                 
-                # Debug: Log what we're sending
-                if attempt == 0:  # Only log on first attempt to reduce noise
+                # Debug: Log what we're sending (only if ELECTRUMX_DEBUG is enabled)
+                if ELECTRUMX_DEBUG and attempt == 0:  # Only log on first attempt to reduce noise
                     print(f"[ELECTRUMX] Sending request: {method} (id={self.request_id})")
                 
                 try:
@@ -655,8 +738,8 @@ class ElectrumXProvider(APIProvider):
                         
                         buffer += chunk
                         
-                        # Debug: Log first chunk received
-                        if attempt == 0 and len(buffer) == len(chunk):
+                        # Debug: Log first chunk received (only if ELECTRUMX_DEBUG is enabled)
+                        if ELECTRUMX_DEBUG and attempt == 0 and len(buffer) == len(chunk):
                             print(f"[ELECTRUMX] Received first chunk: {len(chunk)} bytes for {method}")
                         
                         # Check if we have a complete line (newline-delimited JSON)
@@ -665,7 +748,7 @@ class ElectrumXProvider(APIProvider):
                             parts = buffer.split(b'\n', 1)
                             response_data = parts[0]
                             buffer = parts[1] if len(parts) > 1 else b""
-                            if attempt == 0:
+                            if ELECTRUMX_DEBUG and attempt == 0:
                                 print(f"[ELECTRUMX] Received complete response: {len(response_data)} bytes for {method}")
                             break
                         
@@ -687,18 +770,18 @@ class ElectrumXProvider(APIProvider):
                                 parts = buffer.split(b'\n', 1)
                                 response_data = parts[0]
                                 buffer = parts[1] if len(parts) > 1 else b""
-                                if attempt == 0:
+                                if ELECTRUMX_DEBUG and attempt == 0:
                                     print(f"[ELECTRUMX] Received response on timeout: {len(response_data)} bytes for {method}")
                                 break
                             # If we have data but no newline, use it anyway (like test_connectivity.py)
                             response_data = buffer
                             buffer = b""
-                            if attempt == 0:
+                            if ELECTRUMX_DEBUG and attempt == 0:
                                 print(f"[ELECTRUMX] Using incomplete response: {len(response_data)} bytes for {method}")
                             break
                         # No data yet, continue waiting
                         elapsed = time.time() - start_time
-                        if attempt == 0 and elapsed > 2.0:
+                        if ELECTRUMX_DEBUG and attempt == 0 and elapsed > 2.0:
                             print(f"[ELECTRUMX] Still waiting for response for {method} (elapsed: {elapsed:.1f}s)")
                         continue
                     except (BrokenPipeError, ConnectionResetError, OSError) as e:
@@ -709,7 +792,7 @@ class ElectrumXProvider(APIProvider):
                 # If we exited the loop without finding newline but have data, use it
                 if not response_data and buffer:
                     response_data = buffer
-                    if attempt == 0:
+                    if ELECTRUMX_DEBUG and attempt == 0:
                         print(f"[ELECTRUMX] Using buffer data after loop: {len(response_data)} bytes for {method}")
                 
                 # Close socket after request (like test_connectivity.py)
@@ -1158,6 +1241,47 @@ class ElectrumXProvider(APIProvider):
         except Exception as e:
             print(f"[ELECTRUMX] Error broadcasting transaction: {e}")
             raise
+    
+    async def get_address_block_range(self, address: str) -> Optional[Tuple[int, int]]:
+        """
+        Get the earliest and latest block heights for an address efficiently.
+        Uses blockchain.scripthash.get_history which returns (tx_hash, height) pairs
+        without needing to fetch full transaction data.
+        
+        Returns:
+            Tuple of (earliest_block, latest_block) or None if no confirmed transactions
+        """
+        try:
+            # Convert address to scripthash
+            scripthash = self._address_to_scripthash(address)
+            
+            if not scripthash:
+                print(f"[ELECTRUMX] Could not convert address {address} to scripthash")
+                return None
+            
+            # Get transaction history (list of tx_hash + height pairs)
+            history = await self._send_request("blockchain.scripthash.get_history", [scripthash])
+            
+            if not history or not isinstance(history, list):
+                print(f"[ELECTRUMX] No transactions found for {address}")
+                return None
+            
+            # Extract confirmed block heights (filter out unconfirmed: height <= 0)
+            heights = [entry.get("height", 0) for entry in history if entry.get("height", 0) > 0]
+            
+            if not heights:
+                print(f"[ELECTRUMX] No confirmed transactions for {address}")
+                return None
+            
+            earliest = min(heights)
+            latest = max(heights)
+            
+            print(f"[ELECTRUMX] Block range for {address[:16]}...: {earliest} - {latest}")
+            return (earliest, latest)
+            
+        except Exception as e:
+            print(f"[ELECTRUMX] Error getting block range for {address}: {str(e)[:100]}")
+            return None
     
     async def close(self):
         """Cleanup - close the persistent connection"""

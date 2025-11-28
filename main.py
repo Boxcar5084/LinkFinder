@@ -1,19 +1,86 @@
 # -*- coding: utf-8 -*-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from contextlib import asynccontextmanager
 import uuid
 import asyncio
 import sqlite3
 from datetime import datetime
-from api_provider import get_provider
+from api_provider import get_provider, APIProvider
 from graph_engine import BitcoinAddressLinker
 from cache_manager import TransactionCache
 from checkpoint_manager import CheckpointManager
 from export_manager import ExportManager
 from config import DEFAULT_API, MEMPOOL_API_KEY
 from pathlib import Path
+
+
+async def determine_block_range(
+    api: APIProvider,
+    list_a: List[str],
+    list_b: List[str]
+) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Determine optimal block range by querying addresses.
+    
+    - Queries all addresses in list_a to find the EARLIEST block (minimum across all)
+    - Queries all addresses in list_b to find the LATEST block (maximum across all)
+    
+    Args:
+        api: The API provider to use for queries
+        list_a: Source addresses (used to find earliest block)
+        list_b: Target addresses (used to find latest block)
+    
+    Returns:
+        Tuple of (earliest_block, latest_block) or (None, None) if no valid blocks found
+    """
+    print(f"[BLOCK_RANGE] Detecting optimal block range...")
+    print(f"[BLOCK_RANGE] Querying {len(list_a)} addresses from list_a for earliest block...")
+    
+    # Find earliest block from list_a
+    earliest_blocks = []
+    for address in list_a:
+        try:
+            block_range = await api.get_address_block_range(address)
+            if block_range:
+                earliest, _ = block_range
+                earliest_blocks.append(earliest)
+                print(f"[BLOCK_RANGE]   {address[:16]}...: earliest = {earliest}")
+        except Exception as e:
+            print(f"[BLOCK_RANGE]   {address[:16]}...: ERROR - {str(e)[:50]}")
+            continue
+    
+    print(f"[BLOCK_RANGE] Querying {len(list_b)} addresses from list_b for latest block...")
+    
+    # Find latest block from list_b
+    latest_blocks = []
+    for address in list_b:
+        try:
+            block_range = await api.get_address_block_range(address)
+            if block_range:
+                _, latest = block_range
+                latest_blocks.append(latest)
+                print(f"[BLOCK_RANGE]   {address[:16]}...: latest = {latest}")
+        except Exception as e:
+            print(f"[BLOCK_RANGE]   {address[:16]}...: ERROR - {str(e)[:50]}")
+            continue
+    
+    # Calculate results
+    detected_earliest = min(earliest_blocks) if earliest_blocks else None
+    detected_latest = max(latest_blocks) if latest_blocks else None
+    
+    if detected_earliest is not None and detected_latest is not None:
+        print(f"[BLOCK_RANGE] Detected range: {detected_earliest} - {detected_latest}")
+    elif detected_earliest is not None:
+        print(f"[BLOCK_RANGE] Detected earliest block: {detected_earliest} (no latest found)")
+    elif detected_latest is not None:
+        print(f"[BLOCK_RANGE] Detected latest block: {detected_latest} (no earliest found)")
+    else:
+        print(f"[BLOCK_RANGE] Could not detect block range from addresses")
+    
+    return (detected_earliest, detected_latest)
+
 
 # Global state
 print("[MAIN] Initializing global services...")
@@ -94,6 +161,41 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
         if hasattr(api, 'open'):
             await api.open()
 
+        # AUTO-DETECT BLOCK RANGE
+        # Query list_a for earliest block, list_b for latest block
+        detected_earliest, detected_latest = await determine_block_range(
+            api, request.list_a, request.list_b
+        )
+        
+        # Apply detected range as bounds (user values must be within range)
+        effective_start_block = request.start_block
+        effective_end_block = request.end_block
+        
+        if detected_earliest is not None:
+            if effective_start_block is None or effective_start_block < detected_earliest:
+                if effective_start_block is not None:
+                    print(f"[BLOCK_RANGE] User start_block ({effective_start_block}) is before earliest activity ({detected_earliest})")
+                effective_start_block = detected_earliest
+        
+        if detected_latest is not None:
+            if effective_end_block is None or effective_end_block > detected_latest:
+                if effective_end_block is not None:
+                    print(f"[BLOCK_RANGE] User end_block ({effective_end_block}) is after latest activity ({detected_latest})")
+                effective_end_block = detected_latest
+        
+        # Log final block range
+        print(f"[BLOCK_RANGE] Final block range: {effective_start_block} - {effective_end_block}")
+        
+        # Store detected and effective block range in session metadata
+        sessions[session_id]['block_range'] = {
+            'detected_earliest': detected_earliest,
+            'detected_latest': detected_latest,
+            'user_start_block': request.start_block,
+            'user_end_block': request.end_block,
+            'effective_start_block': effective_start_block,
+            'effective_end_block': effective_end_block
+        }
+
         # Create wrapper linker that updates trace state for checkpointing
         checkpoint_state = sessions[session_id].get('checkpoint_state')
         print(f"[MAIN] Creating linker with cache_manager: {cache_manager}")
@@ -167,8 +269,8 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
         results = await linker.find_connection(
             request.list_a, request.list_b,
             request.max_depth,
-            request.start_block,
-            request.end_block,
+            effective_start_block,
+            effective_end_block,
             connection_callback=connection_callback
         )
 
@@ -210,6 +312,7 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
         checkpoint_data = {
             'session_id': session_id,
             'request': sessions[session_id].get('request'),
+            'block_range': sessions[session_id].get('block_range'),  # Save effective block range
             'trace_state': {
                 'visited_forward': visited_forward,
                 'visited_backward': visited_backward,
@@ -305,6 +408,7 @@ async def _periodic_checkpoint_task(session_id: str):
             checkpoint_data = {
                 'session_id': session_id,
                 'request': sessions[session_id].get('request'),
+                'block_range': sessions[session_id].get('block_range'),  # Save effective block range
                 'trace_state': {
                     'visited_forward': visited_forward,  # Dict is already serializable
                     'visited_backward': visited_backward,  # Dict is already serializable
@@ -637,6 +741,7 @@ async def force_checkpoint(session_id: str):
     checkpoint_data = {
         'session_id': session_id,
         'request': session.get('request'),
+        'block_range': session.get('block_range'),  # Save effective block range
         'trace_state': {
             'visited_forward': visited_forward,
             'visited_backward': visited_backward,
@@ -720,6 +825,7 @@ async def resume_trace(session_id: str, checkpoint_id: str):
             'start_block': request.start_block,
             'end_block': request.end_block
         },
+        'block_range': checkpoint_data.get('block_range'),  # Restore effective block range from checkpoint
         'checkpoint_id': checkpoint_id,
         'trace_state': normalized_trace_state,
         'checkpoint_state': normalized_trace_state,  # PASS TO LINKER
@@ -786,6 +892,7 @@ async def auto_resume():
             'start_block': request.start_block,
             'end_block': request.end_block
         },
+        'block_range': checkpoint_state.get('block_range'),  # Restore effective block range from checkpoint
         'checkpoint_id': checkpoint_id,
         'trace_state': normalized_trace_state,
         'checkpoint_state': normalized_trace_state,  # PASS TO LINKER
@@ -858,6 +965,7 @@ async def auto_resume_session(session_id: str):
             'start_block': request.start_block,
             'end_block': request.end_block
         },
+        'block_range': checkpoint_state.get('block_range'),  # Restore effective block range from checkpoint
         'checkpoint_id': checkpoint_id,
         'trace_state': normalized_trace_state,
         'checkpoint_state': normalized_trace_state,  # PASS TO LINKER
@@ -1002,12 +1110,14 @@ async def get_checkpoint_details(session_id: str, checkpoint_id: str):
     request_data = checkpoint_data.get('request', {})
     progress = checkpoint_data.get('progress', {})
     trace_state = checkpoint_data.get('trace_state', {})
+    block_range = checkpoint_data.get('block_range', {})
 
     return {
         'session_id': session_id,
         'checkpoint_id': checkpoint_id,
         'timestamp': checkpoint.get('timestamp'),
         'request': request_data,
+        'block_range': block_range,  # Include effective block range
         'progress': progress,
         'trace_state': {
             'connections_found_count': len(trace_state.get('connections_found', [])),

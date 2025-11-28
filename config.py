@@ -45,6 +45,7 @@ ELECTRUMX_HOST = os.getenv("ELECTRUMX_HOST", "100.94.34.56")
 ELECTRUMX_PORT = int(os.getenv("ELECTRUMX_PORT", "50001"))
 ELECTRUMX_USE_SSL = os.getenv("ELECTRUMX_USE_SSL", "false").lower() == "true"
 ELECTRUMX_CERT = os.getenv("ELECTRUMX_CERT", None)  # Optional: path to SSL certificate
+ELECTRUMX_DEBUG = os.getenv("ELECTRUMX_DEBUG", "false").lower() == "true"  # Verbose debug logging
 
 # SSH Configuration for ElectrumX log access
 SSH_HOST = os.getenv("SSH_HOST", None)  # SSH server hostname/IP (may differ from ELECTRUMX_HOST)
