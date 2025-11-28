@@ -7,7 +7,7 @@ Connects two sets of Bitcoin addresses through transaction chains.
 import asyncio
 from typing import Set, Dict, List, Tuple, Optional, Any, Union
 from collections import deque
-from api_provider import APIProvider
+from api_provider import APIProvider, ConnectionLostError
 from cache_manager import TransactionCache
 from config import (
     MAX_TRANSACTIONS_PER_ADDRESS,
@@ -240,6 +240,10 @@ class BitcoinAddressLinker:
         print(f"[*] Fetching: {address} (cache miss, making API call)", flush=True)
         try:
             txs = await self.api.get_address_transactions(address, start_block, end_block)
+        except ConnectionLostError as e:
+            # Re-raise connection loss errors - these should trigger checkpoint save
+            print(f"  [CONN_LOST] Connection lost while fetching {address}: {e}", flush=True)
+            raise
         except Exception as e:
             print(f"  [ERROR] API call failed for {address}: {e}", flush=True)
             raise
@@ -528,9 +532,19 @@ class BitcoinAddressLinker:
                                 full_path = new_path + list(reversed(backward_path[1:]))
                                 target_addr = full_path[-1]
                                 
+                                # CRITICAL: Validate that target_addr is actually in list_b
+                                if target_addr not in list_b:
+                                    print(f"\n[!] MEETING POINT FOUND but target not in list_b: {neighbor}")
+                                    print(f"    Path: {' -> '.join(full_path)}")
+                                    print(f"    Target {target_addr} is not in list_b - continuing search...")
+                                    # Don't report this as a connection, continue searching
+                                    forward_discovered[neighbor] = new_path
+                                    forward_queue.append((neighbor, new_path))
+                                    continue
+                                
                                 print(f"\n[✓] MEETING POINT FOUND: {neighbor}")
                                 print(f" Path: {' -> '.join(full_path)}")
-                                print(f" Source: {full_path[0]} -> Target: {target_addr}")
+                                print(f" Source: {full_path[0]} -> Target: {target_addr} (verified in list_b)")
                                 
                                 # Create connection object
                                 connection = {
@@ -581,6 +595,12 @@ class BitcoinAddressLinker:
                                     results['queued_forward'] = [item[0] for item in list(forward_queue)]
                                     results['queued_backward'] = [item[0] for item in list(backward_queue)]
                                     return results
+                                
+                                # After finding a valid connection, still add neighbor to discovered
+                                # (it's already in backward_discovered, but add to forward_discovered for consistency)
+                                forward_discovered[neighbor] = new_path
+                                # Don't add to queue - it's already been explored by backward search
+                                continue
 
                             forward_discovered[neighbor] = new_path
                             forward_queue.append((neighbor, new_path))
@@ -595,6 +615,9 @@ class BitcoinAddressLinker:
 
                     addresses_explored += 1
 
+                except ConnectionLostError:
+                    # Re-raise connection loss errors - these should trigger checkpoint save
+                    raise
                 except Exception as e:
                     print(f"    Error: {e}")
 
@@ -695,9 +718,19 @@ class BitcoinAddressLinker:
                                 full_path = forward_path + list(reversed(new_path[1:]))
                                 target_addr = full_path[-1]
                                 
+                                # CRITICAL: Validate that target_addr is actually in list_b
+                                if target_addr not in list_b:
+                                    print(f"\n[!] MEETING POINT FOUND but target not in list_b: {neighbor}")
+                                    print(f"    Path: {' -> '.join(full_path)}")
+                                    print(f"    Target {target_addr} is not in list_b - continuing search...")
+                                    # Don't report this as a connection, continue searching
+                                    backward_discovered[neighbor] = new_path
+                                    backward_queue.append((neighbor, new_path))
+                                    continue
+                                
                                 print(f"\n[✓] MEETING POINT FOUND: {neighbor}")
                                 print(f" Path: {' -> '.join(full_path)}")
-                                print(f" Source: {full_path[0]} -> Target: {target_addr}")
+                                print(f" Source: {full_path[0]} -> Target: {target_addr} (verified in list_b)")
                                 
                                 # Create connection object
                                 connection = {
@@ -748,6 +781,12 @@ class BitcoinAddressLinker:
                                     results['queued_forward'] = [item[0] for item in list(forward_queue)]
                                     results['queued_backward'] = [item[0] for item in list(backward_queue)]
                                     return results
+                                
+                                # After finding a valid connection, still add neighbor to discovered
+                                # (it's already in forward_discovered, but add to backward_discovered for consistency)
+                                backward_discovered[neighbor] = new_path
+                                # Don't add to queue - it's already been explored by forward search
+                                continue
 
                             backward_discovered[neighbor] = new_path
                             backward_queue.append((neighbor, new_path))
@@ -772,6 +811,9 @@ class BitcoinAddressLinker:
 
                     addresses_explored += 1
 
+                except ConnectionLostError:
+                    # Re-raise connection loss errors - these should trigger checkpoint save
+                    raise
                 except Exception as e:
                     print(f"    Error: {e}")
 

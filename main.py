@@ -7,7 +7,7 @@ import uuid
 import asyncio
 import sqlite3
 from datetime import datetime
-from api_provider import get_provider, APIProvider
+from api_provider import get_provider, APIProvider, ConnectionLostError
 from graph_engine import BitcoinAddressLinker
 from cache_manager import TransactionCache
 from checkpoint_manager import CheckpointManager
@@ -354,6 +354,83 @@ async def _run_trace_task(session_id: str, request: TraceRequest):
                 await api.close()
         except Exception as close_err:
             print(f"[WARN] Error closing connection on cancel: {close_err}")
+
+    except ConnectionLostError as e:
+        """Connection lost - save checkpoint and stop gracefully"""
+        print(f"[CONN] Session {session_id} connection lost: {e}")
+        print(f"[CONN] Method: {e.method}, Last error: {e.last_error}")
+        
+        # Cancel periodic checkpoint task if running
+        if checkpoint_task:
+            checkpoint_task.cancel()
+        
+        # Save current trace state as checkpoint
+        trace_state = sessions[session_id].get('trace_state', {})
+        
+        # Explicitly extract all fields to ensure complete state saving
+        visited_forward = trace_state.get('visited_forward', {})
+        visited_backward = trace_state.get('visited_backward', {})
+        visited = trace_state.get('visited', set())
+        queued_forward = trace_state.get('queued_forward', [])
+        queued_backward = trace_state.get('queued_backward', [])
+        connections_found = trace_state.get('connections_found', [])
+        search_depth = trace_state.get('search_depth', 0)
+        status = trace_state.get('status', 'connection_lost')
+        
+        checkpoint_data = {
+            'session_id': session_id,
+            'request': sessions[session_id].get('request'),
+            'block_range': sessions[session_id].get('block_range'),  # Save effective block range
+            'trace_state': {
+                'visited_forward': visited_forward,
+                'visited_backward': visited_backward,
+                'visited': list(visited) if isinstance(visited, set) else visited,  # Convert set to list for saving
+                'queued_forward': queued_forward,
+                'queued_backward': queued_backward,
+                'connections_found': connections_found,
+                'search_depth': search_depth,
+                'status': status
+            },
+            'connection_lost_at': datetime.now().isoformat(),
+            'connection_error': {
+                'method': e.method,
+                'last_error': e.last_error
+            },
+            'progress': {
+                'addresses_examined': len(visited) if isinstance(visited, set) else len(visited) if isinstance(visited, list) else 0,
+                'visited_forward': len(visited_forward),
+                'visited_backward': len(visited_backward),
+                'connections_found': len(connections_found),
+            }
+        }
+
+        checkpoint_id = checkpoint_manager.create_checkpoint(session_id, checkpoint_data)
+
+        # Update session status
+        sessions[session_id].update({
+            'status': 'connection_lost',
+            'message': f'Connection to ElectrumX lost. Checkpoint saved automatically.',
+            'connection_lost_at': datetime.now().isoformat(),
+            'checkpoint_id': checkpoint_id,
+            'checkpoint_message': f'Checkpoint {checkpoint_id} saved. Resume with: /resume/{session_id}/{checkpoint_id}',
+            'progress': checkpoint_data['progress'],
+            'connection_error': {
+                'method': e.method,
+                'last_error': e.last_error
+            },
+            'task': None  # Clear task reference
+        })
+
+        print(f"[SAVE] Checkpoint saved on connection loss: {checkpoint_id}")
+        print(f"       Addresses examined: {checkpoint_data['progress']['addresses_examined']}")
+        print(f"       Resume available via: /resume/{session_id}/{checkpoint_id}")
+        
+        # Close connection if possible
+        try:
+            if 'api' in locals():
+                await api.close()
+        except Exception as close_err:
+            print(f"[WARN] Error closing connection on connection loss: {close_err}")
 
     except Exception as e:
         print(f"[ERR] Session {session_id} failed: {e}")

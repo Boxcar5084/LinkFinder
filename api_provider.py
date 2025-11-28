@@ -37,6 +37,17 @@ except ImportError:
     print("[ELECTRUMX] Warning: ssl module not available")
 
 
+class ConnectionLostError(Exception):
+    """
+    Exception raised when connection to ElectrumX server is lost after all retries.
+    This signals to the caller that they should save a checkpoint and stop gracefully.
+    """
+    def __init__(self, message: str, method: str = None, last_error: str = None):
+        self.method = method  # The RPC method that failed
+        self.last_error = last_error  # The last error that occurred
+        super().__init__(message)
+
+
 class APIProvider(ABC):
     """Base class for blockchain data providers"""
 
@@ -646,8 +657,21 @@ class ElectrumXProvider(APIProvider):
             print(f"[ELECTRUMX] Version negotiation failed: {e}")
             return False
     
-    async def _send_request(self, method: str, params: list, timeout: Optional[int] = None, max_retries: int = 3) -> Dict[str, Any]:
-        """Send a JSON-RPC request to ElectrumX over persistent connection"""
+    async def _send_request(self, method: str, params: list, timeout: Optional[int] = None, max_retries: int = 3, raise_on_connection_loss: bool = True) -> Dict[str, Any]:
+        """
+        Send a JSON-RPC request to ElectrumX over persistent connection.
+        
+        Args:
+            method: The RPC method to call
+            params: Parameters for the RPC method
+            timeout: Request timeout in seconds
+            max_retries: Maximum number of retry attempts
+            raise_on_connection_loss: If True, raise ConnectionLostError when all retries fail
+                                       If False, return empty dict (for non-critical operations)
+        
+        Raises:
+            ConnectionLostError: When connection is lost and all retries are exhausted (if raise_on_connection_loss=True)
+        """
         self.request_id += 1
         # Reset progress logging for this request
         self._last_logged_mb = 0
@@ -660,13 +684,17 @@ class ElectrumXProvider(APIProvider):
         }
         
         request_timeout = timeout if timeout is not None else self.timeout
-        retry_delay = 2  # Start with 2 seconds
+        base_retry_delay = 5  # Start with 5 seconds (increased from 2)
+        last_error = None  # Track the last error for ConnectionLostError
+        is_connection_loss = False  # Track if this looks like a connection loss
         
         for attempt in range(max_retries):
             try:
                 if attempt > 0:
-                    print(f"[ELECTRUMX] Retry attempt {attempt + 1}/{max_retries}...")
-                    await asyncio.sleep(retry_delay * attempt)  # Exponential backoff
+                    # Exponential backoff with longer delays: 5s, 10s, 20s...
+                    wait_time = base_retry_delay * (2 ** (attempt - 1))
+                    print(f"[ELECTRUMX] Retry attempt {attempt + 1}/{max_retries} after {wait_time}s delay...")
+                    await asyncio.sleep(wait_time)
                 # Create a fresh socket for each request (ElectrumX closes idle connections quickly)
                 # This matches how test_connectivity.py works - create socket, send, receive, close
                 sock = None
@@ -688,6 +716,8 @@ class ElectrumXProvider(APIProvider):
                         sock.settimeout(self.timeout)
                         sock.connect((self.host, self.port))
                 except Exception as e:
+                    last_error = f"Connection failed: {str(e)[:100]}"
+                    is_connection_loss = True
                     if attempt == 0:
                         print(f"[ELECTRUMX] Connection failed: {e}")
                     if sock:
@@ -708,6 +738,8 @@ class ElectrumXProvider(APIProvider):
                     # Send immediately (like test_connectivity.py)
                     sock.sendall(message.encode('utf-8'))
                 except (BrokenPipeError, OSError) as e:
+                    last_error = f"Error sending request: {str(e)[:100]}"
+                    is_connection_loss = True
                     if attempt == 0:
                         print(f"[ELECTRUMX] Error sending request: {e}")
                     try:
@@ -803,11 +835,13 @@ class ElectrumXProvider(APIProvider):
                 
                 # Parse response
                 if not response_data:
+                    last_error = "Empty response from server"
+                    is_connection_loss = True
                     if attempt < max_retries - 1:
                         print(f"[ELECTRUMX] Empty response for {method}, will retry...")
                         continue
                     print(f"[ELECTRUMX] Empty response from server after retries for {method}")
-                    return {}
+                    break  # Exit loop to raise ConnectionLostError
                 
                 try:
                     response_text = response_data.decode('utf-8').strip()
@@ -825,12 +859,14 @@ class ElectrumXProvider(APIProvider):
                     # Validate JSON-RPC response structure
                     is_valid, validation_error = self._validate_jsonrpc_response(response, self.request_id)
                     if not is_valid:
+                        last_error = f"Invalid JSON-RPC response: {validation_error}"
+                        is_connection_loss = True  # Invalid response often indicates connection issues
                         if attempt < max_retries - 1:
                             print(f"[ELECTRUMX] Invalid JSON-RPC response, will retry: {validation_error}")
                             continue
                         print(f"[ELECTRUMX] Invalid JSON-RPC response: {validation_error}")
                         print(f"[ELECTRUMX] Response was: {response_text[:200]}")
-                        return {}
+                        break  # Exit loop to raise ConnectionLostError
                     
                     # Check for error response
                     if "error" in response and response["error"]:
@@ -846,12 +882,19 @@ class ElectrumXProvider(APIProvider):
                     return result
                     
                 except json.JSONDecodeError as e:
+                    error_str = str(e)
+                    last_error = f"JSON decode error: {error_str}"
+                    # All JSON decode errors indicate connection issues or corrupted data
+                    is_connection_loss = True
+                    # Detect truncated responses (specific connection loss indicators)
+                    if "Unterminated string" in error_str or "Expecting" in error_str:
+                        print(f"[ELECTRUMX] Truncated response detected (likely connection loss): {e}")
                     if attempt < max_retries - 1:
                         print(f"[ELECTRUMX] JSON decode error, will retry: {e}")
                         continue
                     print(f"[ELECTRUMX] JSON decode error: {e}")
                     print(f"[ELECTRUMX] Response was: {response_data[:200]}")
-                    return {}
+                    break  # Exit loop to raise ConnectionLostError
             
             except socket.timeout:
                 # Ensure socket is closed
@@ -860,46 +903,61 @@ class ElectrumXProvider(APIProvider):
                         sock.close()
                     except:
                         pass
+                last_error = f"Socket timeout after {request_timeout}s"
+                is_connection_loss = True
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Socket timeout, will retry...")
                     continue
                 print(f"[ELECTRUMX] Socket timeout after {request_timeout}s (all retries exhausted)")
-                return {}
+                break  # Exit loop to raise ConnectionLostError
             except ConnectionRefusedError:
                 if sock:
                     try:
                         sock.close()
                     except:
                         pass
+                last_error = f"Connection refused to {self.host}:{self.port}"
+                is_connection_loss = True
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Connection refused, will retry...")
                     continue
                 print(f"[ELECTRUMX] Connection refused to {self.host}:{self.port}")
-                return {}
+                break  # Exit loop to raise ConnectionLostError
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 if sock:
                     try:
                         sock.close()
                     except:
                         pass
+                last_error = f"Connection error: {str(e)[:100]}"
+                is_connection_loss = True
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Connection lost, will retry: {str(e)[:50]}")
                     continue
                 print(f"[ELECTRUMX] Connection error: {str(e)[:100]}")
-                return {}
+                break  # Exit loop to raise ConnectionLostError
             except Exception as e:
                 if sock:
                     try:
                         sock.close()
                     except:
                         pass
+                last_error = f"Unexpected error: {str(e)[:100]}"
                 if attempt < max_retries - 1:
                     print(f"[ELECTRUMX] Error (will retry): {str(e)[:100]}")
                     continue
                 print(f"[ELECTRUMX] Socket error: {str(e)[:100]}")
-                return {}
+                break  # Exit loop to raise ConnectionLostError
         
-        # All retries exhausted
+        # All retries exhausted - check if we should raise ConnectionLostError
+        if raise_on_connection_loss and is_connection_loss:
+            raise ConnectionLostError(
+                f"Connection to ElectrumX lost after {max_retries} retries for method '{method}'",
+                method=method,
+                last_error=last_error
+            )
+        
+        # Return empty dict for non-critical operations or non-connection-loss errors
         return {}
     
     def _should_skip_large_transaction(self, tx_data: Any, response_size_bytes: int = 0) -> bool:
@@ -988,11 +1046,14 @@ class ElectrumXProvider(APIProvider):
                 # Check cache first
                 if prev_txid not in prev_tx_cache:
                     # Fetch the previous transaction
+                    # Use raise_on_connection_loss=False for individual lookups
+                    # (non-critical operations that shouldn't stop the entire trace)
                     prev_tx_data = await self._send_request(
                         "blockchain.transaction.get", 
                         [prev_txid, True],  # verbose=True
                         timeout=10,
-                        max_retries=2
+                        max_retries=2,
+                        raise_on_connection_loss=False  # Don't raise for individual input lookups
                     )
                     prev_tx_cache[prev_txid] = prev_tx_data
                 else:
@@ -1025,7 +1086,9 @@ class ElectrumXProvider(APIProvider):
                                 vin["prevout"]["value"] = prev_output["value"]
                             
             except Exception as e:
-                # Log but continue - don't fail the whole transaction
+                # Log but continue for all errors - don't fail the whole transaction
+                # Note: ConnectionLostError won't be raised here since raise_on_connection_loss=False
+                # is used for individual input lookups (non-critical operations)
                 pass  # Silently skip to avoid log spam
         
         return tx
