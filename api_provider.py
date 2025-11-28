@@ -12,7 +12,9 @@ from config import (
     SKIP_MIXER_INPUT_THRESHOLD,
     SKIP_MIXER_OUTPUT_THRESHOLD,
     SKIP_DISTRIBUTION_MAX_INPUTS,
-    SKIP_DISTRIBUTION_MIN_OUTPUTS
+    SKIP_DISTRIBUTION_MIN_OUTPUTS,
+    MAX_TRANSACTIONS_PER_ADDRESS,
+    EXCHANGE_WALLET_THRESHOLD
 )
 import socket
 import json
@@ -1002,7 +1004,13 @@ class ElectrumXProvider(APIProvider):
                 print(f"[ELECTRUMX] No transactions found for {address}")
                 return []
             
-            print(f"[ELECTRUMX] Found {len(history)} transaction entries")
+            total_tx_count = len(history)
+            print(f"[ELECTRUMX] Found {total_tx_count} transaction entries")
+            
+            # EARLY FILTERING: Skip addresses with too many transactions (likely exchanges)
+            if total_tx_count > EXCHANGE_WALLET_THRESHOLD:
+                print(f"[ELECTRUMX] SKIPPING address {address}: {total_tx_count} txs exceeds exchange threshold ({EXCHANGE_WALLET_THRESHOLD})")
+                return []
             
             # Step 2: Filter by block range and collect tx hashes
             tx_hashes_to_fetch = []
@@ -1017,6 +1025,12 @@ class ElectrumXProvider(APIProvider):
                     continue
                 
                 tx_hashes_to_fetch.append((tx_hash, height))
+            
+            # LIMIT transactions to fetch (avoid wasting resources on high-activity addresses)
+            if len(tx_hashes_to_fetch) > MAX_TRANSACTIONS_PER_ADDRESS:
+                print(f"[ELECTRUMX] Limiting fetch to {MAX_TRANSACTIONS_PER_ADDRESS} of {len(tx_hashes_to_fetch)} transactions (MAX_TRANSACTIONS_PER_ADDRESS)")
+                # Take most recent transactions (usually at end of history, but sort by height to be safe)
+                tx_hashes_to_fetch = sorted(tx_hashes_to_fetch, key=lambda x: x[1] if x[1] > 0 else float('inf'), reverse=True)[:MAX_TRANSACTIONS_PER_ADDRESS]
             
             print(f"[ELECTRUMX] Fetching full details for {len(tx_hashes_to_fetch)} transactions")
             
