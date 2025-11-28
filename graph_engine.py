@@ -205,6 +205,34 @@ class BitcoinAddressLinker:
                 self._exchange_wallet_cache[address] = True
                 print(f"  [SKIP] Skipping exchange wallet (from cache): {address} ({len(cached)} transactions)")
                 return []
+            
+            # CRITICAL FIX: Resolve input addresses for cached transactions if using ElectrumX
+            # Cached transactions may not have input addresses resolved
+            if hasattr(self.api, '_resolve_input_addresses'):
+                needs_resolution = False
+                for tx in cached:
+                    vin_list = tx.get('vin', [])
+                    if vin_list:
+                        for vin in vin_list:
+                            # Check if input address is missing (not coinbase)
+                            if not vin.get('coinbase') and not vin.get('is_coinbase'):
+                                if not vin.get('prevout', {}).get('scriptpubkey_address'):
+                                    needs_resolution = True
+                                    break
+                    if needs_resolution:
+                        break
+                
+                if needs_resolution:
+                    print(f"    [CACHE] Resolving input addresses for {len(cached)} cached transactions...")
+                    resolved_txs = []
+                    for tx in cached:
+                        resolved_tx = await self.api._resolve_input_addresses(tx)
+                        resolved_txs.append(resolved_tx)
+                    # Update cache with resolved transactions
+                    if USE_CACHE:
+                        self.cache.store(address, resolved_txs, block_range)
+                    return resolved_txs
+            
             return cached
 
         # Cache miss or cache disabled - fetch from API
@@ -455,7 +483,14 @@ class BitcoinAddressLinker:
                     progress_callback({
                         'visited': len(forward_visited) + len(backward_visited),
                         'current': current,
-                        'direction': 'forward'   
+                        'direction': 'forward',
+                        # Include full state for checkpoint saving
+                        'visited_forward': dict(forward_discovered),
+                        'visited_backward': dict(backward_discovered),
+                        'queued_forward': [item[0] for item in list(forward_queue)],
+                        'queued_backward': [item[0] for item in list(backward_queue)],
+                        'connections_found': list(results['connections_found']),
+                        'search_depth': current_depth
                     })
 
                 try:
@@ -567,8 +602,17 @@ class BitcoinAddressLinker:
 
             # Backward step - ONLY FOLLOW INPUTS
             print(f"\n[<<] Backward BFS (queue: {len(backward_queue)}):")
+            print(f"    [DIAG] backward_discovered has {len(backward_discovered)} addresses")
+            print(f"    [DIAG] backward_visited has {len(backward_visited)} addresses")
             backward_queue_size = len(backward_queue)
             addresses_explored = 0
+            
+            # Diagnostic counters for entire backward step
+            diag_total_txs_retrieved = 0
+            diag_total_inputs_extracted = 0
+            diag_inputs_already_discovered = 0
+            diag_inputs_exchange_wallet = 0
+            diag_inputs_added_to_queue = 0
 
             for _ in range(backward_queue_size):
                 if not backward_queue:
@@ -578,6 +622,7 @@ class BitcoinAddressLinker:
 
                 # Skip if already visited in THIS SEARCH SESSION
                 if current in backward_visited:
+                    print(f"    [DIAG] Skipping {current} - already in backward_visited")
                     continue
 
                 backward_visited.add(current)
@@ -587,17 +632,31 @@ class BitcoinAddressLinker:
                     progress_callback({
                         'visited': len(forward_visited) + len(backward_visited),
                         'current': current,
-                        'direction': 'backward'   
+                        'direction': 'backward',
+                        # Include full state for checkpoint saving
+                        'visited_forward': dict(forward_discovered),
+                        'visited_backward': dict(backward_discovered),
+                        'queued_forward': [item[0] for item in list(forward_queue)],
+                        'queued_backward': [item[0] for item in list(backward_queue)],
+                        'connections_found': list(results['connections_found']),
+                        'search_depth': current_depth
                     })
 
                 try:
                     txs = await self.get_address_txs(current, start_block, end_block)
+                    diag_total_txs_retrieved += len(txs) if txs else 0
                     
                     if not txs:
-                        print(f"    [DEBUG] No transactions found for {current}")
+                        print(f"    [DIAG] No transactions found for {current}")
+                    else:
+                        print(f"    [DIAG] Retrieved {len(txs)} transactions for {current}")
                     
                     input_count = 0
                     skipped_inputs = 0
+                    addr_inputs_discovered = 0
+                    addr_inputs_exchange = 0
+                    addr_inputs_added = 0
+                    
                     for tx in txs:
                         # BACKWARD direction: Only follow INPUTS
                         # Who SENT money TO this address?
@@ -606,6 +665,7 @@ class BitcoinAddressLinker:
                         inputs = self._extract_addresses(tx, 'input')
                         total_inputs = len(inputs)
                         input_count += total_inputs
+                        diag_total_inputs_extracted += total_inputs
                         
                         # Limit input addresses per transaction to prevent queue flooding
                         # This handles transactions with many inputs that weren't filtered as extreme mixers
@@ -616,11 +676,15 @@ class BitcoinAddressLinker:
                         
                         for neighbor in inputs:
                             if neighbor in backward_discovered:
+                                addr_inputs_discovered += 1
+                                diag_inputs_already_discovered += 1
                                 continue
                             
                             # Skip exchange wallets
                             if await self._is_exchange_wallet(neighbor, start_block, end_block):
                                 print(f"    [SKIP] Exchange wallet neighbor: {neighbor}")
+                                addr_inputs_exchange += 1
+                                diag_inputs_exchange_wallet += 1
                                 continue
 
                             new_path = path + [neighbor]
@@ -687,6 +751,16 @@ class BitcoinAddressLinker:
 
                             backward_discovered[neighbor] = new_path
                             backward_queue.append((neighbor, new_path))
+                            addr_inputs_added += 1
+                            diag_inputs_added_to_queue += 1
+                    
+                    # Per-address diagnostic summary
+                    print(f"    [DIAG] Address {current} summary:")
+                    print(f"           Txs: {len(txs) if txs else 0}, Inputs extracted: {input_count}")
+                    print(f"           Skipped (already discovered): {addr_inputs_discovered}")
+                    print(f"           Skipped (exchange wallet): {addr_inputs_exchange}")
+                    print(f"           Skipped (limit): {skipped_inputs}")
+                    print(f"           Added to queue: {addr_inputs_added}")
                     
                     if input_count == 0 and txs:
                         print(f"    [DEBUG] Found {len(txs)} transactions but 0 extractable input addresses for {current}")
@@ -702,6 +776,22 @@ class BitcoinAddressLinker:
                     print(f"    Error: {e}")
 
             print(f"  Backward explored {addresses_explored}, queue: {len(backward_queue)}")
+            
+            # Overall backward step diagnostic summary
+            print(f"\n    [DIAG] ===== BACKWARD STEP SUMMARY (Depth {current_depth}) =====")
+            print(f"    [DIAG] Total transactions retrieved: {diag_total_txs_retrieved}")
+            print(f"    [DIAG] Total inputs extracted: {diag_total_inputs_extracted}")
+            print(f"    [DIAG] Inputs skipped (already discovered): {diag_inputs_already_discovered}")
+            print(f"    [DIAG] Inputs skipped (exchange wallet): {diag_inputs_exchange_wallet}")
+            print(f"    [DIAG] Inputs added to queue: {diag_inputs_added_to_queue}")
+            if diag_total_inputs_extracted > 0:
+                skip_rate = ((diag_inputs_already_discovered + diag_inputs_exchange_wallet) / diag_total_inputs_extracted) * 100
+                print(f"    [DIAG] Skip rate: {skip_rate:.1f}%")
+            elif diag_total_txs_retrieved > 0:
+                print(f"    [DIAG] WARNING: {diag_total_txs_retrieved} transactions but 0 inputs extracted!")
+            else:
+                print(f"    [DIAG] WARNING: No transactions retrieved for any backward address!")
+            print(f"    [DIAG] ================================================")
 
             print(f"\n[STATUS] Depth {current_depth}:")
             print(f" Forward: visited={len(forward_visited)}, discovered={len(forward_discovered)}, queue={len(forward_queue)}")

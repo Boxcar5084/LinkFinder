@@ -950,6 +950,86 @@ class ElectrumXProvider(APIProvider):
         
         return False
     
+    async def _resolve_input_addresses(self, tx: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Resolve input addresses by fetching the previous transactions.
+        
+        ElectrumX doesn't include input addresses directly - we need to look up
+        each input's previous transaction and get the address from its output.
+        
+        Args:
+            tx: Transaction dict with vin entries containing txid and vout
+        
+        Returns:
+            Transaction dict with resolved prevout.scriptpubkey_address for each input
+        """
+        if "vin" not in tx or not tx["vin"]:
+            return tx
+        
+        # Cache for previous transactions we've already fetched
+        prev_tx_cache = {}
+        
+        for vin in tx["vin"]:
+            # Skip if already has address
+            if vin.get("prevout", {}).get("scriptpubkey_address"):
+                continue
+            
+            # Skip coinbase inputs (no previous transaction)
+            if vin.get("coinbase") or vin.get("is_coinbase"):
+                continue
+            
+            prev_txid = vin.get("txid")
+            prev_vout = vin.get("vout", 0)
+            
+            if not prev_txid:
+                continue
+            
+            try:
+                # Check cache first
+                if prev_txid not in prev_tx_cache:
+                    # Fetch the previous transaction
+                    prev_tx_data = await self._send_request(
+                        "blockchain.transaction.get", 
+                        [prev_txid, True],  # verbose=True
+                        timeout=10,
+                        max_retries=2
+                    )
+                    prev_tx_cache[prev_txid] = prev_tx_data
+                else:
+                    prev_tx_data = prev_tx_cache[prev_txid]
+                
+                if prev_tx_data and isinstance(prev_tx_data, dict):
+                    # Get the output at the specified index
+                    vouts = prev_tx_data.get("vout", [])
+                    if prev_vout < len(vouts):
+                        prev_output = vouts[prev_vout]
+                        
+                        # Extract address from the previous output
+                        address = None
+                        
+                        # Try various formats
+                        if "scriptpubkey_address" in prev_output:
+                            address = prev_output["scriptpubkey_address"]
+                        elif "scriptPubKey" in prev_output and isinstance(prev_output["scriptPubKey"], dict):
+                            spk = prev_output["scriptPubKey"]
+                            address = spk.get("address") or (spk.get("addresses", [None])[0] if spk.get("addresses") else None)
+                        elif "address" in prev_output:
+                            address = prev_output["address"]
+                        
+                        if address:
+                            if "prevout" not in vin:
+                                vin["prevout"] = {}
+                            vin["prevout"]["scriptpubkey_address"] = address
+                            # Also copy value if available
+                            if "value" in prev_output:
+                                vin["prevout"]["value"] = prev_output["value"]
+                            
+            except Exception as e:
+                # Log but continue - don't fail the whole transaction
+                pass  # Silently skip to avoid log spam
+        
+        return tx
+
     def _convert_electrum_tx_to_mempool_format(self, tx_data: Any, tx_hash: str, height: int) -> Dict[str, Any]:
         """
         Convert Electrum protocol transaction format to Mempool format (vout/vin with scriptpubkey_address)
@@ -1155,6 +1235,10 @@ class ElectrumXProvider(APIProvider):
                         
                         # Convert to Mempool format
                         tx_obj = self._convert_electrum_tx_to_mempool_format(tx_data, tx_hash, height)
+                        
+                        # CRITICAL: Resolve input addresses by fetching previous transactions
+                        # This is required for backward tracing to work properly
+                        tx_obj = await self._resolve_input_addresses(tx_obj)
                         
                         # Validate transaction format
                         is_valid, validation_error = self._validate_transaction_format(tx_obj)

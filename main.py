@@ -555,39 +555,50 @@ class BitcoinAddressLinkerWithCheckpoint:
         return result
 
     def _progress_callback(self, progress):
-        """Update trace_state as progress is reported"""
+        """Update trace_state as progress is reported with full state from graph_engine"""
         session = self.sessions.get(self.session_id)
         if not session or 'trace_state' not in session:
             return
         
         current = progress.get('current', '')
-        direction = progress.get('direction', 'forward')
         
-        # Ensure visited_forward and visited_backward are dicts
+        # Ensure trace_state has all required fields initialized
+        if 'visited' not in session['trace_state']:
+            session['trace_state']['visited'] = set()
         if 'visited_forward' not in session['trace_state']:
             session['trace_state']['visited_forward'] = {}
         if 'visited_backward' not in session['trace_state']:
             session['trace_state']['visited_backward'] = {}
-        if 'visited' not in session['trace_state']:
-            session['trace_state']['visited'] = set()
+        if 'queued_forward' not in session['trace_state']:
+            session['trace_state']['queued_forward'] = []
+        if 'queued_backward' not in session['trace_state']:
+            session['trace_state']['queued_backward'] = []
         if 'connections_found' not in session['trace_state']:
             session['trace_state']['connections_found'] = []
-        
-        # Convert to dict if it's a set (backward compatibility)
-        if isinstance(session['trace_state']['visited_forward'], set):
-            session['trace_state']['visited_forward'] = {addr: [addr] for addr in session['trace_state']['visited_forward']}
-        if isinstance(session['trace_state']['visited_backward'], set):
-            session['trace_state']['visited_backward'] = {addr: [addr] for addr in session['trace_state']['visited_backward']}
+        if 'search_depth' not in session['trace_state']:
+            session['trace_state']['search_depth'] = 0
         
         # DEFENSIVE FIX: Convert visited from list to set if needed (checkpoint resume issue)
         if isinstance(session['trace_state']['visited'], list):
             session['trace_state']['visited'] = set(session['trace_state']['visited'])
         
-        # Add to visited set
+        # Add current address to visited set
         session['trace_state']['visited'].add(current)
         
-        # Track direction - graph_engine manages the dict structure, so we just ensure it exists
-        # The actual path tracking is done in graph_engine, not here
+        # Update full state from progress data (passed from graph_engine)
+        # These fields contain the complete current state for checkpoint saving
+        if 'visited_forward' in progress:
+            session['trace_state']['visited_forward'] = progress['visited_forward']
+        if 'visited_backward' in progress:
+            session['trace_state']['visited_backward'] = progress['visited_backward']
+        if 'queued_forward' in progress:
+            session['trace_state']['queued_forward'] = progress['queued_forward']
+        if 'queued_backward' in progress:
+            session['trace_state']['queued_backward'] = progress['queued_backward']
+        if 'connections_found' in progress:
+            session['trace_state']['connections_found'] = progress['connections_found']
+        if 'search_depth' in progress:
+            session['trace_state']['search_depth'] = progress['search_depth']
 
 
 
